@@ -8,7 +8,8 @@
 # pack's mods and configs from $TUXMINE_DIR/server and the oracle jar, starts it with -Dgtnh.oracle.autorun=true,
 # and collects the JSON the oracle writes 20 server ticks after start (some mods, GTNHRates among them, rewrite
 # recipes on the first tick) before it exits the JVM. Nothing connects to the production server; the copy listens
-# on 127.0.0.1 only, on a spare port, with online-mode off.
+# on 127.0.0.1 only, on a free random port (RECIPE_EXPORT_PORT), with online-mode off. Runs do not serialize
+# unless RECIPE_EXPORT_LOCK names a lock file; give parallel runs separate RECIPE_EXPORT_WORK and _OUT dirs.
 #
 # Then it builds the recipe database (tools/recipes/build_db.py) unless RECIPE_EXPORT_NO_DB=1, and stamps the
 # `recipes` component with tools/packstate.py when that database is <root>/data/recipes.sqlite and the packs did
@@ -29,9 +30,10 @@
 #   JAVA                 java binary (17+)          default /usr/lib/jvm/java-25-openjdk/bin/java, else `java`
 #   JAVA_HOME_BUILD      JDK for the Gradle build (default: the JDK of $JAVA if it has javac, else java-25)
 #   RECIPE_EXPORT_MEM    max heap                   default 6G (GTNH 2.9.0 needs about 5-6 GB)
-#   RECIPE_EXPORT_LOCK   lock file; only one heavy JVM at a time across agents  default /tmp/dave-agent-heavy-jvm.lock
+#   RECIPE_EXPORT_LOCK   optional flock file to serialize runs (the build and the server wait on it)  default none:
+#                        runs go in parallel, each on its own port and RECIPE_EXPORT_WORK
 #   RECIPE_EXPORT_TIMEOUT seconds                   default 3600
-#   RECIPE_EXPORT_PORT   server port                default 25599
+#   RECIPE_EXPORT_PORT   server port                default a free random port on the host that runs the server
 #   RECIPE_EXPORT_SKIP   space-separated jar-name prefixes from the server pack to leave out
 #                        default "davebridge DiscordIntegration journeymap" (no recipes; DaveBridge opens a
 #                        WebSocket listener and DiscordIntegration logs in to Discord)
@@ -60,10 +62,11 @@ work="${RECIPE_EXPORT_WORK:-$root/.work/recipe-export}"
 out="${RECIPE_EXPORT_OUT:-$root/data/exports/recipes}"
 db="${DAVE_RECIPES_DB:-$root/data/recipes.sqlite}"
 mem="${RECIPE_EXPORT_MEM:-6G}"
-lock="${RECIPE_EXPORT_LOCK:-/tmp/dave-agent-heavy-jvm.lock}"
+lock="${RECIPE_EXPORT_LOCK:-}"
 timeout_s="${RECIPE_EXPORT_TIMEOUT:-3600}"
-port="${RECIPE_EXPORT_PORT:-25599}"
+port="${RECIPE_EXPORT_PORT:-}"
 skip="${RECIPE_EXPORT_SKIP:-davebridge DiscordIntegration journeymap}"
+locked=(); [[ -n "$lock" ]] && locked=(flock "$lock")   # empty: no serialization
 server_pack="$tux/server"
 staged="${RECIPE_EXPORT_STAGED:-}"
 
@@ -167,7 +170,7 @@ else
     if [[ -x "$jh/bin/javac" ]]; then build_home="$jh"; else build_home=/usr/lib/jvm/java-25-openjdk; fi
   fi
   log "building the oracle (JAVA_HOME=$build_home)"
-  (cd "$here/oracle" && JAVA_HOME="$build_home" flock "$lock" ./gradlew --no-daemon -q build) 2>&1 \
+  (cd "$here/oracle" && JAVA_HOME="$build_home" "${locked[@]}" ./gradlew --no-daemon -q build) 2>&1 \
     | grep -v '^INFO: merging' || true
   oracle_jar="$(ls -t "$here"/oracle/build/libs/*.jar 2>/dev/null | grep -v -e '-dev' -e 'sources' | head -n 1 || true)"
 fi
@@ -189,7 +192,7 @@ if [[ -n "${RECIPE_EXPORT_HOST:-}" ]]; then
   set +e
   ssh "${ssh_opts[@]}" "$host" "cd '$rdir' && RECIPE_EXPORT_NO_DB=1 ORACLE_JAR='$rdir/$(basename "$oracle_jar")' \
     JAVA='${RECIPE_EXPORT_REMOTE_JAVA:-java}' RECIPE_EXPORT_PORT='$port' RECIPE_EXPORT_MEM='$mem' \
-    RECIPE_EXPORT_TIMEOUT='$timeout_s' RECIPE_EXPORT_LOCK='$rdir/.lock' RECIPE_EXPORT_STAGED='$rdir/stage' \
+    RECIPE_EXPORT_TIMEOUT='$timeout_s' RECIPE_EXPORT_LOCK='${lock:+$rdir/.lock}' RECIPE_EXPORT_STAGED='$rdir/stage' \
     RECIPE_EXPORT_WORK='$rdir/work' RECIPE_EXPORT_OUT='$rdir/out' bash '$rdir/repo/tools/recipe-export/run.sh' '$rdir/pack'"
   code=$?
   set -e
@@ -234,6 +237,9 @@ props="$server/server.properties"
 set_prop() { if grep -q "^$1=" "$props"; then sed -i "s|^$1=.*|$1=$2|" "$props"; else echo "$1=$2" >> "$props"; fi; }
 set_prop online-mode false
 set_prop server-ip 127.0.0.1
+if [[ -z "$port" ]]; then
+  port="$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+fi
 set_prop server-port "$port"
 set_prop enable-query false
 set_prop enable-rcon false
@@ -247,11 +253,11 @@ echo "[]" > "$server/ops.json"
 mkdir -p "$records"
 runtime_log="$work/server.log"
 : > "$runtime_log"
-log "starting the server (heap $mem, timeout ${timeout_s}s, waits for $lock); log: $runtime_log"
+log "starting the server (port $port, heap $mem, timeout ${timeout_s}s${lock:+, waits for $lock}); log: $runtime_log"
 start=$SECONDS
 (
   cd "$server"
-  exec setsid flock "$lock" "$java_bin" -Xms1G -Xmx"$mem" -Dfml.readTimeout=180 -Duser.language=en @java9args.txt \
+  exec setsid "${locked[@]}" "$java_bin" -Xms1G -Xmx"$mem" -Dfml.readTimeout=180 -Duser.language=en @java9args.txt \
     -Dgtnh.oracle.autorun=true -Dgtnh.oracle.outputDir="$records" -Dgtnh.oracle.datasetVersionId=dave \
     -jar lwjgl3ify-forgePatches.jar nogui < /dev/null
 ) >> "$runtime_log" 2>&1 &
