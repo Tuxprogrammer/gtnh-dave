@@ -296,6 +296,20 @@ public final class BridgeService {
         }
         hello.add("accepts", types);
         session.send(hello);
+        for (java.util.function.Consumer<ClientSession> listener : authListeners) {
+            try {
+                listener.accept(session);
+            } catch (Throwable t) {
+                DaveBridge.LOG.warn("Auth listener failed for {}", session, t);
+            }
+        }
+    }
+
+    private final java.util.List<java.util.function.Consumer<ClientSession>> authListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Runs {@code listener} (on the socket thread) for each agent right after its {@code hello}. */
+    public void addAuthListener(java.util.function.Consumer<ClientSession> listener) {
+        authListeners.add(listener);
     }
 
     /** Constant-time comparison against the configured token. An empty configured token never matches. */

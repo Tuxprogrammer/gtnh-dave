@@ -35,14 +35,15 @@ Every connection must authenticate with the `authToken` from `config/davebridge.
 On success the server sends:
 
 ```json
-{"type":"hello","ts":1730000000000,"protocol":1,"mod":"davebridge","version":"0.2.6",
- "session":3,"botName":"Dave","accepts":["client_eval","describe","eval","lesson","lesson_stop","list_players",
- "ping","say","thinking"]}
+{"type":"hello","ts":1730000000000,"protocol":1,"mod":"davebridge","version":"0.3.0",
+ "session":3,"botName":"Dave","accepts":["client_eval","describe","eval","hook_add","hook_list","hook_remove",
+ "lesson","lesson_stop","list_players","ping","say","snapshot_get","snapshot_list","thinking","undo"]}
 ```
 
 `accepts` lists the inbound message types this server handles, sorted. Older servers list fewer: milestone 1 had
 `list_players`, `ping`, `say` and `thinking`; milestone 2 added `eval`, `describe` and `client_eval` (section 1.8);
-0.2.0 added `lesson` and `lesson_stop`. New types are added here, so the daemon can feature-detect.
+0.2.0 added `lesson` and `lesson_stop`; 0.3.0 added `hook_add`, `hook_list`, `hook_remove` (section 1.9),
+`snapshot_list`, `snapshot_get` and `undo` (section 1.10). New types are added here, so the daemon can feature-detect.
 
 Connections beyond `maxClients` are refused at the handshake.
 
@@ -131,6 +132,10 @@ unknown states are dropped, unknown reasons become `other`, `id` is cut to 64 ch
 `state` is `finished` (a non-looping lesson played to the end; `reason` `done`) or `stopped`, with `reason` one of
 `player` (chat button, stop key or `/davebridge stop`), `walked_away`, `dimension`, `replaced` (a newer lesson),
 `agent` (`lesson_stop`), `timeout` (10 minutes of play), `rejected` (the client could not play it) or `other`.
+
+#### `hook_fired`, `hook_disabled`, `undo_pending`
+
+Event hooks (section 1.9) and undo (section 1.10). Sent without `reqId`.
 
 #### `server_stopping`
 
@@ -402,12 +407,13 @@ text, and chains become a hover list, all with warnings.
 | `bad_request` | A field is missing or has the wrong type; binary frame; second `auth`. |
 | `unknown_type` | No handler for `type`. |
 | `unauthorized` | Not authenticated (the connection is then closed). |
-| `not_found` | Target player is not online (`lesson`, `lesson_stop`, `describe`, `client_eval`; `say` and `thinking` answer `recipients: 0` instead). `describe` also: dimension not loaded, no such entity. |
+| `not_found` | Target player is not online (`lesson`, `lesson_stop`, `describe`, `client_eval`; `say` and `thinking` answer `recipients: 0` instead). `describe` also: dimension not loaded, no such entity. `hook_remove`: no such hook. `undo`, `snapshot_get`: no such snapshot (or its file is gone). |
 | `no_client_mod` | `lesson` / `lesson_stop`: the player has no client half that plays lessons. |
 | `queue_full` | The main-thread queue is at `maxQueueDepth`. Retry later. |
-| `cancelled` | The server is stopping: queued actions that had not run yet, `write` evals still waiting for a confirm, and any message received while it stops. Sent before `server_stopping` and the close. |
+| `cancelled` | The server is stopping: queued actions that had not run yet, `write` evals and undos still waiting for a confirm, and any message received while it stops. Sent before `server_stopping` and the close. |
 | `internal` | A handler threw. Logged on the server; the server itself is unaffected. |
-| `disabled` | The feature is turned off in the server config: `eval` (`eval.evalEnabled`), `client_eval` (`eval.clientEvalRelay`). |
+| `disabled` | The feature is turned off in the server config: `eval` (`eval.evalEnabled`), `client_eval` (`eval.clientEvalRelay`), `hook_add` (`hooks.hooksEnabled`), `undo` and the snapshot requests (`undo.undoEnabled`, or no world loaded). |
+| `limit` | `hook_add`: the server (`hookMaxCount`) or the owner (`hookMaxPerOwner`) already has the most hooks allowed. |
 | `not_opted_in` | `client_eval` for a player whose client half has not opted in (or has no client half, or speaks another packet protocol). |
 | `unsupported` | `client_eval` for a client half too old to run scripts (no `eval` capability). |
 
@@ -437,6 +443,7 @@ accidents (a frozen tick, a crashed server, a world change nobody saw), not atta
 | `params` | no | JSON value, bound as `params` (numbers arrive as doubles: use `params.n as int`); missing means an empty map. |
 | `timeoutMs` | no | Time limit, default `evalTimeoutMillis` (500), clamped to 10..`evalMaxTimeoutMillis` (5000). |
 | `confirmTimeoutSeconds` | no | `write` only: how long to wait for the click, default `confirmTimeoutSeconds` (120), clamped to 5..`confirmMaxTimeoutSeconds` (600). |
+| `snapshot` | no | `write` only (0.3.0): a region `{"dim":0,"from":[x,y,z],"to":[x,y,z]}` or an array of up to 16, saved to the undo journal right before the script runs (`dim` defaults to the asker's). At most `undoMaxRegionBlocks` blocks in all (`bad_request` otherwise). Use it when the script changes things block capture cannot see (section 1.10). |
 
 **What a script sees.** `server` (MinecraftServer), `player` (the asker's EntityPlayerMP, or null), `asker` (name),
 `world` (the asker's world, else the overworld), `params`, `log`, `out` (`println` goes to the result's `output`), and
@@ -449,6 +456,11 @@ accidents (a frozen tick, a crashed server, a world change nobody saw), not atta
   `dave.describe(dim,x,y,z)`, `dave.describe(stack)`, `dave.looking(player)`;
 - formatting: `dave.item(stack)` (`id, meta, count, name, ore, nbt`), `dave.fluid(fluidStack)`, `dave.markupId(stack)`
   (for `{item:...}`), `dave.waypoint(x,y,z,dim,label)` (a `{waypoint:...}` markup link), `dave.dump(obj)`.
+
+`undo` (since 0.3.0) adds positions to the undo journal of a confirmed write (section 1.10): `undo.save(world,x,y,z)`,
+`undo.region(world,x1,y1,z1,x2,y2,z2)` (also with a dimension id instead of `world`) and `undo.active`. Outside a
+confirmed write (read scripts, hooks, undo turned off) it is inactive and its calls do nothing. In a confirmed write,
+`dave.te(dim,x,y,z)` also saves the position first.
 
 Common packages are imported (`net.minecraft.{block,entity,entity.player,init,inventory,item,nbt,server,tileentity,
 util,world}`, `net.minecraftforge.{common.util,fluids,oredict}`); other classes need their full name or an import.
@@ -492,7 +504,9 @@ Reply:
 `expired`, `too_many_pending`. `ms`, `line` and `stack` are present only once the script ran (not for `compile`,
 `blocked`, `needs_confirm` or the `write` outcomes without a run); `error` is cut to 2000 characters, `stack` to 12
 frames. `output` is present only when the script printed something. Optional fields: `truncated`,
-`outputTruncated`, `warnings`, `confirmed`, `confirmedBy`. Request errors (`bad_request`, `disabled`, `queue_full`,
+`outputTruncated`, `warnings`, `confirmed`, `confirmedBy`, and for a confirmed write that changed something (0.3.0)
+`snapshot` (its id, e.g. `u12`), `snapshotBlocks`, `snapshotEntities` and `snapshotPartial`; journal notes (things an
+undo will not cover) come as `warnings` starting with `undo:`. Request errors (`bad_request`, `disabled`, `queue_full`,
 `cancelled`, `internal`) come as `error` messages.
 
 **World changes need the asking player's confirm (`mode:"write"`).** An accident guard against the agent's mistakes:
@@ -506,6 +520,8 @@ frames. `output` is present only when the script printed something. Optional fie
   player may have 5 waiting. The server console (or RCON) may answer any confirm, which is how an asker who is not
   online (a `/dave ask` test name) is confirmed.
 - If `backupCommand` is set, it runs right before the confirmed script.
+- Since 0.3.0 the confirmed script runs inside a change journal and what it changed is saved as an undo snapshot
+  (section 1.10). The asker's "Done." line then carries an `[Undo]` button (`/dave undo <snapshot>`).
 
 #### `describe`
 
@@ -568,6 +584,198 @@ The relayed fields are `ok`, `ms`, and when the client sent them `result`, `erro
 `not_opted_in` (it refused: the player opted out before it ran). If the client does not answer within
 `clientEvalTimeoutSeconds` the result is `ok:false` with `errorType:"timeout"`; if the player logs out first, or the
 server stops, `errorType:"disconnected"`.
+
+
+### 1.9 Event hooks (0.3.0)
+
+The agent subscribes to game events, or to a condition polled on the server thread, and gets a `hook_fired` event
+when one fires; the Dave daemon turns it into a turn for Dave (`dave/ENVELOPE.md`, `kind="event"`). Hooks are kept
+in the world folder (`<world>/davebridge/hooks.json`), so they survive restarts and agent reconnects.
+
+#### `hook_add`
+
+```json
+{"type":"hook_add","reqId":20,"hook":{"event":"poll","owner":"Steve","name":"EBF done",
+ "note":"tell Steve his EBF at 100,64,-20 finished its batch",
+ "script":"def te = dave.te(0,100,64,-20); te != null && !te.getMetaTileEntity().isActive()",
+ "everyTicks":100,"once":true}}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `event` | required | `player_join`, `player_leave`, `player_death`, `player_dimension`, `entity_death`, `block_break` (a player broke a block), `block_place` (a player placed one), `chat` (any chat line, triggered or not), `quest_complete` (BetterQuesting; refused without BQ), or `poll` |
+| `owner` | required | The player the hook is for. Resolved to the online player's name; `ownerUuid` as for `/dave ask` (section 5) |
+| `name` | the event | Label, up to 64 characters |
+| `note` | none | Up to 500 characters, handed back in every `hook_fired`: what the agent wants to do then |
+| `notify` | `owner` | Informational for the agent: `owner`, `@a` or a player name |
+| `script` | none | Groovy. `poll`: the condition (required). Other events: an extra filter that must be truthy |
+| `params` | `{}` | Bound as `params` in the script |
+| `filter` | `{}` | All set keys must match: `player` (the acting player, case-insensitive; for `entity_death` the killer), `entity` (substring of the entity's registry name, class or custom name; also the killer's), `block` (`modid:name` or `modid:name:meta`; a bare name is `minecraft:`), `dim`, `box` (`[x1,y1,z1,x2,y2,z2]`, inclusive), `contains` (substring of the chat or death message), `quest` (a quest id or name; a name that resolves is stored as its UUID, otherwise it matches quest names containing it). Unknown keys are `bad_request` |
+| `everyTicks` | `100` | `poll`: run interval, `hookMinPollTicks`..72000 |
+| `once` | `true` | Remove the hook after it fires |
+| `cooldownSeconds` | `hookDefaultCooldownSeconds` (10) | Minimum time between firings of this hook |
+| `edge` | `true` | `poll`: fire when the condition turns from false to true; `false`: on every true run (with the cooldown) |
+| `fireIfTrueAtStart` | `false` | `poll`: fire right away if the condition is already true on its first run |
+| `expiresInSeconds` | `hookDefaultTtlHours` (7 days) | Removed after this; `0` = never, unless `hookMaxTtlHours` caps it |
+
+**Scripts.** Compiled once (on add and after a restart), with eval's compile checks (section 1.8). A script that
+calls a world changer is refused (`bad_request`): hooks run unattended, so they only watch. Each run has eval's
+bindings (`player` is the owner when online, `asker` the owner's name) plus `hook` (`id`, `name`, `owner`,
+`fireCount`, `lastFiredAt`), `state` (a map kept between runs of this hook, in memory only), and for event hooks
+`event` (the Forge event) and `facts` (below). The time limit is `hookPollTimeoutMillis` (50 ms); exceptions and
+timeouts are caught. After `hookMaxErrors` (5) failures in a row the hook is disabled (`hook_disabled`). A poll
+condition runs once when added: if it fails then, the hook is not added (`bad_request` with the error). Poll hooks
+run in the server tick within `hookTickBudgetMillis` (5 ms) per tick, most overdue first (at least one per tick); the
+rest wait for the next tick. A condition's value is its Groovy truth; a non-boolean truthy value (a map, a list, a
+number) is sent as `detail.result`. Polls never load chunks unless the script does: `dave.te` returns null for an
+unloaded position.
+
+Reply: `{"type":"ack","ok":true,"for":"hook_add","hook":{...the stored hook, with "id":"h3"...},"firstRun":{"truthy":false,"value":false},"warnings":[...]}`
+(`firstRun` for poll hooks only). Errors: `bad_request` (validation, compile, a world-changing script, a failing first
+run), `limit`, `disabled`.
+
+#### `hook_list` / `hook_remove`
+
+```json
+{"type":"hook_list","owner":"Steve","reqId":21}
+{"type":"hook_remove","id":"h3","reqId":22}
+{"type":"hook_remove","owner":"Steve","reqId":23}
+```
+
+`hook_list` (all hooks without `owner`) answers `{"type":"hooks","hooks":[...],"enabled":true}`; each hook has the
+fields above plus its state: `id`, `ownerUuid`, `createdAt`, `expiresAt` (0 = never), `fireCount`, `lastFiredAt`,
+`lastValue` (poll), `errors` (failures in a row), `lastError`, `disabled`, `suppressed`. `hook_remove` answers
+`ack` with `removed` (the ids); an unknown `id` is `not_found`.
+
+#### `hook_fired`
+
+```json
+{"type":"hook_fired","ts":...,"hookId":"h3","name":"EBF done","event":"poll","owner":"Steve",
+ "ownerUuid":"...","ownerOnline":true,"notify":"owner","note":"tell Steve ...","once":true,"fireCount":1,
+ "suppressed":0,"detail":{"result":{"progress":0}},"removed":true}
+```
+
+`detail` holds the event's facts (capped JSON): `player`, `dim`, `x`, `y`, `z` for player events; `block`, `meta`
+(block events); `message`, `triggered` (chat); `entity`, `entityClass`, `entityName`, `killer` or `killerEntity`,
+`damage`, `message` (the death message) for deaths; `fromDim`, `toDim` (`player_dimension`); `questIds`,
+`questNames` and `player` (`quest_complete`); plus `result` (a non-boolean script value), `output` (what the script
+printed) and `test` (sent by `/dave hooks fire`). `suppressed` counts firings held back by the cooldown or the rate
+limit since the last one sent. `removed` is true when a `once` hook was removed by this firing.
+
+**Rate limits.** A hook fires at most once per `cooldownSeconds`; all hooks together at most `hookMaxFiresPerMinute`
+(30) times a minute. A firing held back is counted in `suppressed`; a `poll` hook held back fires again on its next
+true run.
+
+**No agent connected.** A notification that reaches no agent is kept (`"queued":true` added) in an outbox of up to
+`hookOutboxSize` (50, oldest dropped), saved with the hooks, and sent to the next agent that authenticates, right
+after its `hello`.
+
+Event handlers run at the lowest priority and ignore events other mods cancelled. Only enabled hooks of an event type
+cost anything: without one, the handler returns at once.
+
+#### `hook_disabled`
+
+```json
+{"type":"hook_disabled","ts":...,"hookId":"h4","name":"...","event":"poll","owner":"Steve","ownerUuid":"...",
+ "ownerOnline":true,"notify":"owner","once":true,"reason":"errors","error":"its script failed 5 times in a row; last: ..."}
+```
+
+Sent when a hook's script keeps failing, or no longer compiles (or changes the world) after a restart. The hook stays
+listed with `disabled:true` until removed. Expired hooks are removed silently (logged).
+
+### 1.10 Snapshots and undo (0.3.0)
+
+Every confirmed `write` eval (section 1.8) runs inside a change journal, and what it changed is saved as a
+**snapshot** (`u1`, `u2`, ...) in the world folder (`<world>/davebridge/undo/`: `index.json` and one gzipped NBT file
+per snapshot). An undo puts it back.
+
+**What is recorded.**
+- Every block the script sets through `World.setBlock` (and so `setBlockToAir`, `breakBlock`, and mod code that calls
+  them): block, metadata and tile entity NBT before the change. This uses Forge's block capture
+  (`World.captureBlockSnapshots`), the mechanism behind block-place events. While capturing, the block updates of
+  those changes (neighbor notifications, client updates) are deferred and replayed when the script ends, in order,
+  as Forge does for a player placing a block; blocks that change because of them (a torch on a removed wall) are
+  recorded too, for up to 8 rounds.
+- Positions the script saves first: `undo.save`, `undo.region`, `dave.te(...)`, and the request's `snapshot` regions.
+  Use them for changes capture cannot see: metadata (`setBlockMetadataWithNotify`), inventories, machine settings,
+  any tile entity edited in place.
+- Entities that join a world during the script (item drops, spawned mobs; not the entities of chunks it loads).
+
+When the script ends, positions that are back to how they started are dropped; the rest keep the state the change
+left (block and metadata), to spot later edits. A change bigger than `undoMaxBlocksPerSnapshot` runs anyway; its
+snapshot is `partial`. Snapshots are pruned oldest first beyond `undoMaxSnapshots`, `undoMaxStorageMB` (the newest
+is always kept) and `undoMaxAgeDays`.
+
+**What undo does not cover.** Entities the script killed, moved or changed (only spawned ones are removed); items
+that left the world (picked up, used, despawned); player inventories and other player data (items given to a
+player are not taken back); anything changed in a later tick (falling sand, fluid
+flow, machines that ran since); changes made directly to chunks or by other threads; dimensions loaded during the
+script; internal state that is not in a block's metadata or its tile entity NBT (multiblock structure caches, AE2
+grid state, GT pipe networks), which rebuilds as those mods normally do after a block change. A restored machine is
+reloaded from its saved NBT exactly as on chunk load, so it may need a moment (or a screwdriver) to re-form. The
+optional `backupCommand` remains the full fallback.
+
+#### `snapshot_list`
+
+```json
+{"type":"snapshot_list","player":"Steve","limit":20,"reqId":30}
+```
+
+Answers `{"type":"snapshots","snapshots":[...],"total":13}`, newest first (`limit` 1..200, default 20). Each:
+`id`, `kind` (`eval`, or `undo`: the record of an undo, which undoing re-applies the change), `player`, `summary`,
+`script` (first 2000 characters), `evalId`, `createdAt`, `blocks`, `entities`, `bytes` (0 until written), `dims`,
+`box` (`[minX,minY,minZ,maxX,maxY,maxZ]`), `partial`, `warnings`, and once undone `undoneAt`, `undoneBy`, `redo` (the
+id of the undo's own snapshot); for `kind:"undo"` also `undoOf`.
+
+#### `snapshot_get`
+
+```json
+{"type":"snapshot_get","snapshot":"u12","reqId":31}
+{"type":"snapshot_get","snapshot":"last","of":"Steve","reqId":32}
+```
+
+Answers `{"type":"snapshot","snapshot":{...the fields above..., "changes":[{"dim":0,"x":..,"y":..,"z":..,
+"before":"minecraft:chest","beforeTile":"Chest","after":"minecraft:air"}, ...], "changedSince":0, "unloaded":0}}`:
+the first 30 changes, how many positions in loaded chunks no longer hold what the change left (an undo skips those
+unless forced), and how many are in chunks that are not loaded (not checked). `last` is the newest snapshot not yet
+undone of `of` (anyone without it).
+
+#### `undo`
+
+```json
+{"type":"undo","snapshot":"u12","player":"Steve","force":false,"reqId":33}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `player` | yes | Who confirms it (the daemon fills in the asker) |
+| `snapshot` | no | An id, or `last` (default): the newest snapshot not yet undone of `of` |
+| `of` | no | For `last`: whose (default `player`; `*` = anyone's) |
+| `force` | no | Restore positions changed since too; also undo a snapshot that was already undone |
+| `confirmTimeoutSeconds` | no | As for `write` |
+
+An undo changes the world, so it goes through the same confirm as a write: the player sees `[Dave] wants to undo:
+<summary> (u12, 5 blocks)` with `[Confirm] [Cancel]`, and the agent gets
+`{"type":"undo_pending","snapshot":"u12","player":"Steve","playerOnline":true,"confirmId":"...","summary":"...","expiresInSeconds":120}`.
+On confirm the snapshot is restored on the server thread, `undoTickBudgetMillis` (10 ms) per tick (at least one
+position), newest change first: entities the change spawned are removed if still loaded, then each position gets its
+block, metadata and tile entity back (the tile entity is recreated from its NBT, as on chunk load). Item drops while
+restoring are suppressed (Forge's `restoringBlockSnapshots`), so restoring over a chest does not spill a copy of its
+contents. Chunks and dimensions that are not loaded are loaded, as the change itself did. A position whose block or
+metadata is no longer what the change left is skipped as a conflict unless `force`. The state each position had just
+before the undo is saved as a new snapshot (`kind:"undo"`), so the undo can itself be undone (a redo).
+
+Reply (after the click):
+
+```json
+{"type":"undo_result","ts":...,"snapshot":"u12","ok":true,"restored":5,"conflicts":0,"failed":0,
+ "removedEntities":2,"missingEntities":0,"ticks":1,"ms":3,"redo":"u13","confirmed":true,"confirmedBy":"Steve",
+ "warnings":["..."],"reqId":33}
+```
+
+`ok` is false when a position failed (a block that no longer exists in the registry, a tile entity that could not be
+recreated). Cancelled or expired: `{"type":"undo_result","snapshot":"u12","ok":false,"errorType":"cancelled"|"expired"|"too_many_pending","error":"..."}`.
+Errors: `bad_request` (no `player`; already undone without `force`), `not_found`, `disabled`.
 
 ---
 
@@ -746,6 +954,25 @@ tick by the client half. Eval, `describe`, `client_eval` and lessons submit thei
 | eval | `backupCommand` | (empty) | Server command run right before a confirmed write, e.g. `backup start` (ServerUtilities; it copies in the background, so the backup may finish after the change). |
 | eval | `clientEvalRelay` | `true` | Relay `client_eval` to opted-in players at all. |
 | eval | `clientEvalTimeoutSeconds` | `30` | How long to wait for a client's result. |
+| hooks | `hooksEnabled` | `true` | Accept `hook_add` and fire hooks. Off: hooks are kept but never fire. |
+| hooks | `hookMaxCount` | `64` | Most hooks on the server. |
+| hooks | `hookMaxPerOwner` | `16` | Most hooks one player may own. |
+| hooks | `hookMinPollTicks` | `20` | Shortest `everyTicks` of a poll hook. |
+| hooks | `hookPollTimeoutMillis` | `50` | Time limit of one hook script run (at most `evalMaxTimeoutMillis`). |
+| hooks | `hookTickBudgetMillis` | `5` | Time per tick for poll conditions (at least one runs). |
+| hooks | `hookMaxFiresPerMinute` | `30` | Notifications per minute, all hooks together. |
+| hooks | `hookDefaultCooldownSeconds` | `10` | Default `cooldownSeconds`. |
+| hooks | `hookMaxErrors` | `5` | Script failures in a row before a hook is disabled. |
+| hooks | `hookDefaultTtlHours` | `168` | Lifetime of a hook without `expiresInSeconds`. |
+| hooks | `hookMaxTtlHours` | `0` | Longest lifetime a hook may ask for; 0 = no limit (`expiresInSeconds: 0` then means never). |
+| hooks | `hookOutboxSize` | `50` | Notifications kept while no agent is connected. |
+| undo | `undoEnabled` | `true` | Journal confirmed writes and accept `undo`. |
+| undo | `undoMaxSnapshots` | `100` | Snapshots kept; the oldest go first. |
+| undo | `undoMaxStorageMB` | `64` | Disk space for all snapshots (compressed). |
+| undo | `undoMaxAgeDays` | `30` | Snapshots older than this are deleted; 0 = never. |
+| undo | `undoMaxBlocksPerSnapshot` | `100000` | Positions one snapshot records; beyond it the snapshot is `partial`. |
+| undo | `undoMaxRegionBlocks` | `65536` | Volume of a script's explicit snapshot regions. |
+| undo | `undoTickBudgetMillis` | `10` | Time per tick spent restoring during an undo. |
 
 `/dave reload` re-reads the file. The socket restarts only if `bindAddress`, `port`, `authToken`,
 `maxClients` or `maxMessageBytes` changed (which also drops connected agents), or if `enabled` changed.
@@ -761,13 +988,14 @@ tick by the client half. Eval, `describe`, `client_eval` and lessons submit thei
 ## 5. Commands
 
 `/dave status` and `/dave reload`, permission level 3 (ops). Status shows the socket state, connected and
-authenticated agents, queue depth and timing, how many online players have the client half, and how many changes
-wait for a confirm.
+authenticated agents, queue depth and timing, how many online players have the client half, how many changes
+wait for a confirm, how many hooks there are and whether undo is on.
 
 **Confirms (any player, or the console).**
 
 - `/dave confirm <id>` / `/dave cancel <id>`: what the `[Confirm]` and `[Cancel]` buttons of a world-changing
-  script run (section 1.8). A player may answer only their own confirm; the console (or RCON) may answer any.
+  script or an undo run (sections 1.8, 1.10). A player may answer only their own confirm; the console (or RCON) may
+  answer any.
 
 **Test hooks (ops and the console).** These exist so the whole Dave loop can be exercised from `rcon-cli` with nobody
 online:
@@ -779,11 +1007,27 @@ online:
   online player's, else the overworld spawn (dim 0). Replies need no player online: a public reply is broadcast as
   usual, a whisper to an absent name is dropped with a warning in the `say` ack.
 - `/dave pending`: lists the changes waiting for a confirm (`id`, asking player, seconds left, summary).
+- `/dave hooks [owner]`: lists the hooks (id, event, owner, name, interval, once or repeating, fire count, errors,
+  expiry) and how many notifications wait for an agent. `/dave hooks remove <id>` removes one. `/dave hooks fire
+  <id>` sends a test `hook_fired` (`detail.test:true`; the hook is not removed or counted against the rate limit).
+- `/dave snapshots [player]`: the newest 15 snapshots (id, player, age, blocks, entities, undone and redo, summary)
+  and the disk space used.
+
+**Undo (the console, ops, or the player whose change it was).**
+
+- `/dave undo <id|last> [player] [force]`: restores a snapshot (section 1.10) at once: typing it, or clicking the
+  `[Undo]` button after a confirmed change, is the confirmation. `last` is the newest snapshot not yet undone (of
+  `player` for ops and the console, else the sender's own). A player who is not an op may undo only their own
+  changes. Snapshots of up to 4096 positions are restored inside the command and the result is the reply; bigger
+  ones run over the next ticks and report to the player when done (the console: in the log and `/dave snapshots`).
 
 `DaveBridge/tools/eval_check.py` runs these against a test server (agent socket plus RCON: reads, timeouts, blocked
 calls, describe, a confirmed and a cancelled write, an expiry, `/dave ask`, the starter queries; `--gt` adds the
 GregTech checks). It places one glass block 40 above spawn and removes it again. `dave/daemon/e2e_bridge_check.py`
 does the same through the real daemon and the `bridge` MCP server, with a fake Claude (no model calls).
+`DaveBridge/tools/hooks_undo_check.py` checks hooks and undo (login, chat and poll hooks, refused and failing scripts,
+confirmed writes with snapshots, undo and redo, a chest's contents and drops, conflicts, persistence over a restart,
+the outbox) in two phases around a restart; with `--op-bot` an op'd scripted player stands in for RCON.
 
 Client half only:
 

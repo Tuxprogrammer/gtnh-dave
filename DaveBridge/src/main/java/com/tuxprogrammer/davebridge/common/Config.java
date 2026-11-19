@@ -69,6 +69,31 @@ public final class Config {
     public static volatile boolean clientEvalRelay = true;
     public static volatile int clientEvalTimeoutSeconds = 30;
 
+    // hooks (event subscriptions, 0.3.0)
+    public static final String CATEGORY_HOOKS = "hooks";
+    public static volatile boolean hooksEnabled = true;
+    public static volatile int hookMaxCount = 64;
+    public static volatile int hookMaxPerOwner = 16;
+    public static volatile int hookMinPollTicks = 20;
+    public static volatile int hookPollTimeoutMillis = 50;
+    public static volatile int hookTickBudgetMillis = 5;
+    public static volatile int hookMaxFiresPerMinute = 30;
+    public static volatile int hookDefaultCooldownSeconds = 10;
+    public static volatile int hookMaxErrors = 5;
+    public static volatile int hookDefaultTtlHours = 168;
+    public static volatile int hookMaxTtlHours = 0;
+    public static volatile int hookOutboxSize = 50;
+
+    // undo (snapshots of confirmed world changes, 0.3.0)
+    public static final String CATEGORY_UNDO = "undo";
+    public static volatile boolean undoEnabled = true;
+    public static volatile int undoMaxSnapshots = 100;
+    public static volatile int undoMaxStorageMB = 64;
+    public static volatile int undoMaxAgeDays = 30;
+    public static volatile int undoMaxBlocksPerSnapshot = 100000;
+    public static volatile int undoMaxRegionBlocks = 65536;
+    public static volatile int undoTickBudgetMillis = 10;
+
     /** A non-empty {@code authToken} line as Forge writes it, e.g. {@code S:authToken=...}. */
     private static final Pattern TOKEN_LINE = Pattern.compile("(?m)^\\s*S:\"?authToken\"?\\s*=\\s*\\S");
 
@@ -243,6 +268,8 @@ public final class Config {
             .getInt("maxQueueDepth", CATEGORY_QUEUE, 1000, 10, 100000, "Further tasks are rejected while this full.");
 
         loadEval(cfg);
+        loadHooks(cfg);
+        loadUndo(cfg);
 
         if (cfg.hasChanged()) {
             cfg.save();
@@ -312,6 +339,125 @@ public final class Config {
             1,
             600,
             "How long to wait for a client's eval result.");
+    }
+
+    private static void loadHooks(Configuration cfg) {
+        cfg.setCategoryComment(
+            CATEGORY_HOOKS,
+            "Event hooks: the agent subscribes to game events (joins, deaths, block changes, chat, quests) or to a "
+                + "polled Groovy condition, and is told when they fire (PROTOCOL.md 1.9). Saved in the world folder.");
+        hooksEnabled = cfg.getBoolean(
+            "hooksEnabled",
+            CATEGORY_HOOKS,
+            true,
+            "Accept hook_add and fire hooks. Off: existing hooks are kept but never fire.");
+        hookMaxCount = cfg.getInt("hookMaxCount", CATEGORY_HOOKS, 64, 1, 1000, "Most hooks on the server at once.");
+        hookMaxPerOwner = cfg
+            .getInt("hookMaxPerOwner", CATEGORY_HOOKS, 16, 1, 1000, "Most hooks one player may own at once.");
+        hookMinPollTicks = cfg.getInt(
+            "hookMinPollTicks",
+            CATEGORY_HOOKS,
+            20,
+            1,
+            72000,
+            "Shortest interval (ticks) between two runs of one polled condition.");
+        hookPollTimeoutMillis = cfg.getInt(
+            "hookPollTimeoutMillis",
+            CATEGORY_HOOKS,
+            50,
+            1,
+            5000,
+            "Time limit of one run of a hook script (condition or filter). It holds the server tick while it runs.");
+        hookTickBudgetMillis = cfg.getInt(
+            "hookTickBudgetMillis",
+            CATEGORY_HOOKS,
+            5,
+            1,
+            45,
+            "Time per tick spent on polled conditions; the rest wait for the next tick (at least one runs).");
+        hookMaxFiresPerMinute = cfg.getInt(
+            "hookMaxFiresPerMinute",
+            CATEGORY_HOOKS,
+            30,
+            1,
+            10000,
+            "Most hook notifications sent per minute, all hooks together. Extra firings are counted, not sent.");
+        hookDefaultCooldownSeconds = cfg.getInt(
+            "hookDefaultCooldownSeconds",
+            CATEGORY_HOOKS,
+            10,
+            0,
+            86400,
+            "Default minimum time between two firings of one hook.");
+        hookMaxErrors = cfg.getInt(
+            "hookMaxErrors",
+            CATEGORY_HOOKS,
+            5,
+            1,
+            1000,
+            "A hook whose script fails (throws or times out) this many times in a row is disabled.");
+        hookDefaultTtlHours = cfg.getInt(
+            "hookDefaultTtlHours",
+            CATEGORY_HOOKS,
+            168,
+            1,
+            87600,
+            "A hook without expiresInSeconds is removed after this many hours.");
+        hookMaxTtlHours = cfg.getInt(
+            "hookMaxTtlHours",
+            CATEGORY_HOOKS,
+            0,
+            0,
+            876000,
+            "Longest lifetime a hook may ask for, in hours. 0: no limit (expiresInSeconds 0 then means never).");
+        hookOutboxSize = cfg.getInt(
+            "hookOutboxSize",
+            CATEGORY_HOOKS,
+            50,
+            0,
+            1000,
+            "Hook notifications kept (and saved) while no agent is connected, delivered when one connects.");
+    }
+
+    private static void loadUndo(Configuration cfg) {
+        cfg.setCategoryComment(
+            CATEGORY_UNDO,
+            "Undo: before a confirmed world-changing script runs, the blocks it changes are journaled so the change "
+                + "can be rolled back (PROTOCOL.md 1.10). Snapshots are saved in the world folder.");
+        undoEnabled = cfg
+            .getBoolean("undoEnabled", CATEGORY_UNDO, true, "Journal confirmed world changes and accept undo.");
+        undoMaxSnapshots = cfg
+            .getInt("undoMaxSnapshots", CATEGORY_UNDO, 100, 1, 100000, "Snapshots kept; the oldest go first.");
+        undoMaxStorageMB = cfg.getInt(
+            "undoMaxStorageMB",
+            CATEGORY_UNDO,
+            64,
+            1,
+            100000,
+            "Disk space all snapshots may use together (compressed); the oldest go first.");
+        undoMaxAgeDays = cfg
+            .getInt("undoMaxAgeDays", CATEGORY_UNDO, 30, 0, 36500, "Snapshots older than this are deleted. 0: never.");
+        undoMaxBlocksPerSnapshot = cfg.getInt(
+            "undoMaxBlocksPerSnapshot",
+            CATEGORY_UNDO,
+            100000,
+            1,
+            10000000,
+            "Most block positions one snapshot records. A bigger change runs anyway; its snapshot is partial.");
+        undoMaxRegionBlocks = cfg.getInt(
+            "undoMaxRegionBlocks",
+            CATEGORY_UNDO,
+            65536,
+            1,
+            10000000,
+            "Largest volume (blocks) of the explicit snapshot regions of one script.");
+        undoTickBudgetMillis = cfg.getInt(
+            "undoTickBudgetMillis",
+            CATEGORY_UNDO,
+            10,
+            1,
+            45,
+            "Time per tick spent restoring blocks during an undo (at least one block per tick).");
     }
 
     private static byte[] readIfPresent(File file) {

@@ -42,7 +42,7 @@ Maybe related playbook: Best nitrogen source at HV (playbook/best-nitrogen-sourc
 | `turn@id` | yes | daemon | Unique per turn (`t-` and 10 hex digits); echoed in logs. |
 | `turn@ts` | yes | daemon | UTC ISO-8601. Dave's only clock: the system prompt has no date. |
 | `turn@pack` | yes | `config.toml [pack] version` | Lets Dave notice stale playbook entries. |
-| `turn@kind` | yes | daemon | `question` (every normal turn, including a clicked follow-up button). `retry`: see "Crash or restart" in section 4. Reserved: `event` (join/leave, for greetings later). |
+| `turn@kind` | yes | daemon | `question` (every normal turn, including a clicked follow-up button). `retry`: see "Crash or restart" in section 4. `event`: a hook fired (section 1a). |
 | `player@name`, `player@uuid` | yes | bridge `chat` event | The UUID is the memory key. |
 | `player@dim`, `player@pos` | no | bridge `chat` event | Dimension id and block position (`x,y,z` rounded down), when the server sends them. |
 | `player@hasClientMod` | yes | bridge `chat` event | `true` when the client half is installed. |
@@ -61,6 +61,47 @@ Dave that tag contents are information, not instructions.
 **Why the profile is per turn and not in the system prompt.** The system prompt is recorded once per conversation
 (see `dave/soul/README.md`), and many players share one conversation. Profiles change, and each turn has a
 different asker, so they ride in the envelope.
+
+## 1a. Event turns (`kind="event"`): a hook fired
+
+Dave subscribes to game events with the `hook_add` tool (DaveBridge `hook_add`, PROTOCOL.md 1.9). When a hook fires,
+DaveBridge sends `hook_fired` (or `hook_disabled` when its script kept failing), and the daemon makes it a turn that
+nobody typed:
+
+```xml
+<turn id="t-00004f" ts="2026-11-19T18:04:05Z" pack="2.9.0" kind="event">
+<player name="Alex" uuid="069a79f4-..." source="hook"/>
+<profile>
+Player: Alex (uuid 069a79f4-...)
+...
+</profile>
+<event hook="h3" name="EBF done" type="poll" status="fired" once="true" removed="true" fired="1" notify="owner" ownerOnline="true"/>
+<note>tell Alex his EBF at 100,64,-20 finished its batch</note>
+<detail>{"result":{"progress":0}}</detail>
+</turn>
+```
+
+| Element / attribute | Notes |
+|---|---|
+| `<player>` | The hook's **owner** (`source="hook"`). The owner stands in for the asker: `@whisper` goes to them, and a write or undo in this turn waits for their confirm (the console can confirm for an owner who is offline). The daemon looks up the owner's profile as for a question, with the note as the query. |
+| `<event>` | `hook` (id), `name`, `type` (the hook's event: `player_join`, `poll`, ...), `status` (`fired` or `disabled`), `once`, `removed` (a one-shot hook that is now gone), `fired` (fire count), `notify` (who Dave meant to tell: `owner`, `@a` or a name), `ownerOnline`, and when they apply: `queued="true"` (it fired while the daemon was not connected), `suppressed` (firings held back by the hook's cooldown or the server's rate limit), `coalesced` (later firings of the same hook folded into this turn while it waited), `dropped` (event turns the daemon dropped before this one, see below). |
+| `<note>` | The note Dave wrote when he made the hook: what to do now. |
+| `<detail>` | `status="fired"`: the event's facts as JSON (who, where, which block or entity, the chat or death message, a poll condition's non-boolean result). Cut to 4000 characters. |
+| `<error>` | `status="disabled"`: why the hook was disabled (its script kept failing). Dave tells the owner and offers to fix it. |
+
+Everything inside comes from the game or from Dave's own note and is XML-escaped like player text. There is no
+`<message>`, `<context>`, `<warnings>` or `<recent>`.
+
+**Reply.** The same directives: `@whisper` (to the owner), `@reply` (public, addressing the owner by name) or `@none`
+(nothing worth saying, e.g. the owner is offline and the note was only for them). No thinking indicator is shown, and
+failures (timeout, crash) are logged instead of sent to the owner, because nobody asked.
+
+**Queue and limits** (`[session]` in `config.toml`). Player questions always go first: an event turn runs only when no
+question is waiting. At most `event_max_queued` (3) event turns wait at once and `event_turns_per_hour` (30) are run
+per hour; a firing beyond either is dropped, and the next event turn carries `dropped`. A second firing of a hook
+whose turn is still waiting replaces it (newest detail, `coalesced` counted). An event turn that waited more than
+`event_stale_seconds` (1800) while Dave was free is dropped. DaveBridge rate-limits too (per-hook cooldown and a
+server-wide limit per minute) and keeps firings that reach no daemon in an outbox it delivers on reconnect.
 
 ## 2. The reply out
 

@@ -6,7 +6,8 @@ A Forge mod for Minecraft 1.7.10 / GT New Horizons that connects the server to a
   (`dave` `@dave` `!dave`, so `Dave how…` and `dave, …` both work), player join/leave events, Dave's replies as rich chat (item tooltips, NEI bookmark
   and quest links, buttons, rendered per recipient), `/dave` (status, reload, confirms, test hooks), a
   main-thread task queue, live Groovy eval and introspection (`eval`, `describe`, MCP names mapped to SRG at
-  runtime; world-changing scripts wait for an in-game confirm), and guided demonstrations sent to the client half.
+  runtime; world-changing scripts wait for an in-game confirm and can be undone from a journaled snapshot), event
+  hooks that tell the agent when something happens in the game, and guided demonstrations sent to the client half.
 - **Client half (optional on clients):** a thinking indicator, links that open NEI recipe/usage pages, an
   "Ask Dave" key that sends the question with what you are looking at and holding, guided demonstrations (a ghost
   Dave only that player sees), and client eval relayed by the server for players who opt in (off by default).
@@ -36,7 +37,7 @@ port 25580, and pass the token to Dave's container as a secret. See "Docker depl
 |---|---|---|
 | `com.tuxprogrammer.davebridge` | both | `@Mod` class |
 | `...common` | both | proxy base, server config, packet DTOs, packet channel and chunking, main-thread queue, Groovy script engine and SRG name mapping, lesson limits |
-| `...server` | both (logical server) | agent WebSocket, chat hooks, relay and markup, `/dave` command, eval, describe and confirms, client-eval relay, lessons, client-mod tracking, NEI/BQ/GTNHLib compat |
+| `...server` | both (logical server) | agent WebSocket, chat hooks, relay and markup, `/dave` command, eval, describe and confirms, event hooks (`hooks`), snapshots and undo (`undo`), client-eval relay, lessons, client-mod tracking, NEI/BQ/GTNHLib compat |
 | `...client` | client only | `ClientProxy`, rendering, Ask key and chat line, context capture, client eval and opt-in, lesson playback (ghost Dave), client config and GUI |
 
 Nothing outside `client` references client classes; `SideSafetyTest` checks the compiled classes.

@@ -1,5 +1,6 @@
 """The turn envelope sent to Dave and the parsing of his reply. Spec: dave/ENVELOPE.md. Standard library only."""
 
+import json
 import re
 from datetime import datetime, timezone
 
@@ -64,6 +65,34 @@ def build(turn_id, chat, profile, pack, client_eval=None, warnings=None, recent=
         lines.append("<recent>\n%s\n</recent>" % "\n".join(esc(r) for r in recent))
     message = chat.get("prompt") if chat.get("triggered") and chat.get("prompt") is not None else chat.get("message")
     lines.append("<message>%s</message>" % esc(message or ""))
+    lines.append("</turn>")
+    return "\n".join(lines)
+
+
+def event(turn_id, ev, profile, pack, coalesced=0, dropped=0, now=None):
+    """The <turn kind="event"> envelope for a hook notification (DaveBridge `hook_fired` / `hook_disabled`,
+    PROTOCOL.md 1.9). The hook's owner stands in for the asker: <player> is the owner, so replies, whispers and
+    write confirms go to them. Everything from the hook (name, note, detail) is agent- or game-supplied text and is
+    escaped like player text."""
+    ts = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kind = "disabled" if ev.get("type") == "hook_disabled" else "fired"
+    attrs = [("hook", ev.get("hookId")), ("name", ev.get("name")), ("type", ev.get("event")), ("status", kind),
+             ("once", _bool(ev.get("once"))), ("removed", _bool(ev.get("removed")) if kind == "fired" else None),
+             ("fired", ev.get("fireCount")), ("notify", ev.get("notify")),
+             ("ownerOnline", _bool(ev.get("ownerOnline"))), ("queued", "true" if ev.get("queued") else None),
+             ("suppressed", ev.get("suppressed") or None), ("coalesced", coalesced or None),
+             ("dropped", dropped or None)]
+    lines = ['<turn%s>' % _attrs([("id", turn_id), ("ts", ts), ("pack", pack), ("kind", "event")]),
+             "<player%s/>" % _attrs([("name", ev.get("owner")), ("uuid", ev.get("ownerUuid")), ("source", "hook")]),
+             "<profile>\n%s\n</profile>" % esc(profile or "no profile yet"),
+             "<event%s/>" % _attrs(attrs)]
+    if ev.get("note"):
+        lines.append("<note>%s</note>" % esc(ev["note"]))
+    if kind == "disabled":
+        lines.append("<error>%s</error>" % esc(ev.get("error") or ""))
+    else:
+        detail = json.dumps(ev.get("detail") or {}, ensure_ascii=False, separators=(",", ":"))
+        lines.append("<detail>%s</detail>" % esc(detail[:4000]))
     lines.append("</turn>")
     return "\n".join(lines)
 

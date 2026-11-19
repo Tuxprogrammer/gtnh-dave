@@ -23,7 +23,8 @@ INSTRUCTIONS = (
     "machine or chest holds, where things are. Read pack source in gtnh-src/ first to find the right classes and "
     "fields, then script against them. Prefer a saved query when one fits (query_list); save a script that worked "
     "and will be asked again (query_save). Anything that changes the world must be mode=write with a summary: the "
-    "asking player confirms it in chat before it runs."
+    "asking player confirms it in chat before it runs, and it can be rolled back with undo. hook_add watches the "
+    "game for a player (an event, or a polled condition) and gives you a turn when it happens."
 )
 
 SCRIPT_HELP = (
@@ -42,7 +43,11 @@ TOOLS = [
             "Run a Groovy script in the live game. " + SCRIPT_HELP + " mode=read (default) for looking things up. "
             "mode=write for anything that changes the world, inventories or entities: give summary (one line the "
             "player sees, saying exactly what will change); the call then waits until the asking player clicks "
-            "Confirm or Cancel in chat. side=client runs on the asker's own client instead (only if they opted in: "
+            "Confirm or Cancel in chat. A confirmed write is recorded for undo: blocks it sets (and what falls off "
+            "after), tile entities fetched with dave.te, and spawned entities; the result names the snapshot. For "
+            "changes setBlock doesn't make (metadata, inventories, machine settings) call undo.save(world,x,y,z) or "
+            "undo.region(world,x1,y1,z1,x2,y2,z2) before changing them, or pass snapshot={dim,from:[x,y,z],to:[x,y,z]}. "
+            "side=client runs on the asker's own client instead (only if they opted in: "
             "clientEval=\"true\" in their turn; variables mc, player, world, dave.tooltip(stack)). Errors come back "
             "with errorType (compile, blocked, needs_confirm, timeout, exception), the message and the script line."
         ),
@@ -52,6 +57,8 @@ TOOLS = [
                 "script": {"type": "string"},
                 "mode": {"type": "string", "enum": ["read", "write"], "default": "read"},
                 "summary": {"type": "string", "description": "write only: what will change, for the confirm."},
+                "snapshot": {"description": "write only: region(s) to save for undo before it runs, "
+                                            "{\"dim\":0,\"from\":[x,y,z],\"to\":[x,y,z]} or a list (65536 blocks)."},
                 "params": {"type": "object", "description": "Bound as `params` (numbers arrive as doubles)."},
                 "timeout_ms": {"type": "integer", "description": "Default 500, at most 5000 on the server."},
                 "side": {"type": "string", "enum": ["server", "client"], "default": "server"},
@@ -176,11 +183,100 @@ TOOLS = [
         "description": "Who is online: name, UUID, dimension, position, whether they have the client mod.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "hook_add",
+        "description": (
+            "Watch the game for the player and get a turn when it happens (\"tell me when my EBF finishes / the "
+            "boss dies / Alex joins / the AE system runs low on X / I finish this quest\"). Later you get a "
+            "kind=\"event\" turn with your note and what happened; the owner (default: the asker) stands in as the "
+            "asker there. event: player_join, player_leave, player_death, player_dimension, entity_death, "
+            "block_break, block_place, chat, quest_complete (BetterQuesting), or poll. filter (all optional, all "
+            "must match): player (the acting player; for entity_death the killer), entity (name or class "
+            "substring, e.g. \"Wither\"), block (\"modid:name[:meta]\"), dim, box [x1,y1,z1,x2,y2,z2], contains "
+            "(chat or death message text), quest (id or name). poll needs script: a read-only Groovy condition "
+            "(eval's variables plus state, a map kept between runs, and hook) run every every_ticks (20 = 1 s, "
+            "default 100) that fires when it turns true; return a map instead of true to send details. Event hooks "
+            "may add a script filter too (variables event and facts). Scripts must not change the world, are tested "
+            "once when added (an error comes back), and a hook whose script keeps failing is disabled. once "
+            "(default true) removes the hook after it fires; cooldown_seconds (default 10) spaces repeats; "
+            "expires_in_seconds (default 7 days, 0 = never where the server allows). Write note as an "
+            "instruction to your future self: who to tell and what to say."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event": {"type": "string", "enum": ["player_join", "player_leave", "player_death",
+                                                     "player_dimension", "entity_death", "block_break",
+                                                     "block_place", "chat", "quest_complete", "poll"]},
+                "name": {"type": "string", "description": "Short label, e.g. \"EBF batch done\"."},
+                "note": {"type": "string", "description": "What to do when it fires (up to 500 chars)."},
+                "notify": {"type": "string", "description": "owner (default), @a, or a player name."},
+                "script": {"type": "string", "description": "poll: the condition. Others: an extra filter."},
+                "params": {"type": "object", "description": "Bound as params in the script."},
+                "filter": {"type": "object"},
+                "every_ticks": {"type": "integer", "description": "poll interval in ticks (20 = 1 s)."},
+                "once": {"type": "boolean", "default": True},
+                "cooldown_seconds": {"type": "integer"},
+                "edge": {"type": "boolean", "default": True,
+                         "description": "poll: fire when it turns true (default) or on every true run."},
+                "fire_if_true_at_start": {"type": "boolean", "default": False,
+                                          "description": "poll: fire at once if it is already true."},
+                "expires_in_seconds": {"type": "integer"},
+                "owner": {"type": "string", "description": "Defaults to the asker."},
+            },
+            "required": ["event"],
+        },
+    },
+    {
+        "name": "hook_list",
+        "description": "The hooks on the server (or one owner's): id, event, note, filter, fire count, errors.",
+        "inputSchema": {"type": "object", "properties": {"owner": {"type": "string"}}},
+    },
+    {
+        "name": "hook_remove",
+        "description": "Remove a hook by id, or every hook of an owner.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "owner": {"type": "string"}}},
+    },
+    {
+        "name": "snapshot_list",
+        "description": (
+            "Undo snapshots: every confirmed write records what it changed (id u<n>, player, summary, blocks, "
+            "entities, when, whether undone and its redo id). Newest first; player filters."
+        ),
+        "inputSchema": {"type": "object", "properties": {"player": {"type": "string"},
+                                                         "limit": {"type": "integer", "default": 20}}},
+    },
+    {
+        "name": "snapshot_get",
+        "description": (
+            "One snapshot with a preview before undoing it: the first changes (position, before, after) and "
+            "changedSince, how many positions someone changed after it (an undo skips those unless forced). "
+            "snapshot: an id or \"last\" (the asker's newest)."
+        ),
+        "inputSchema": {"type": "object", "properties": {"snapshot": {"type": "string", "default": "last"},
+                                                         "of": {"type": "string"}}},
+    },
+    {
+        "name": "undo",
+        "description": (
+            "Roll back a confirmed write: puts back the blocks, metadata and tile entities (chest contents, machine "
+            "NBT) it changed and removes entities it spawned (item drops). It changes the world, so the asking "
+            "player confirms it in chat first; the call waits for that. snapshot: an id, or \"last\" (the asker's "
+            "newest; of names another player, \"*\" anyone). Positions changed since are skipped unless force. "
+            "The result has restored, conflicts, warnings and redo (a snapshot that undoes the undo). Undo cannot "
+            "bring back killed entities, used-up items, or anything changed outside the script."
+        ),
+        "inputSchema": {"type": "object", "properties": {"snapshot": {"type": "string", "default": "last"},
+                                                         "of": {"type": "string"},
+                                                         "force": {"type": "boolean", "default": False}}},
+    },
 ]
 
 OPS = {"eval": "eval", "describe": "describe", "query_run": "query_run", "query_list": "query_list",
        "query_get": "query_get", "query_save": "query_save", "say": "say", "list_players": "list_players",
-       "lesson": "lesson", "lesson_stop": "lesson_stop"}
+       "lesson": "lesson", "lesson_stop": "lesson_stop", "hook_add": "hook_add", "hook_list": "hook_list",
+       "hook_remove": "hook_remove", "snapshot_list": "snapshot_list", "snapshot_get": "snapshot_get",
+       "undo": "undo"}
 
 
 def log(msg):

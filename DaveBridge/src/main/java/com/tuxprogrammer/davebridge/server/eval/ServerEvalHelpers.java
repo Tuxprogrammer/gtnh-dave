@@ -14,6 +14,7 @@ import net.minecraftforge.common.DimensionManager;
 
 import com.tuxprogrammer.davebridge.common.eval.EvalHelpers;
 import com.tuxprogrammer.davebridge.server.chat.DaveChat;
+import com.tuxprogrammer.davebridge.server.undo.ChangeJournal;
 
 /**
  * The {@code dave} variable of server-side scripts: {@link EvalHelpers} plus server lookups. Everything here reads
@@ -58,10 +59,18 @@ public final class ServerEvalHelpers extends EvalHelpers {
         return out;
     }
 
-    /** The tile entity at a position if its chunk is loaded, else null. */
+    /**
+     * The tile entity at a position if its chunk is loaded, else null. In a confirmed write, the position is also
+     * saved to the undo journal first, so changes to the tile entity (its inventory, settings) can be undone.
+     */
     public TileEntity te(int dim, int x, int y, int z) {
         World w = world(dim);
-        return w == null || !w.blockExists(x, y, z) ? null : w.getTileEntity(x, y, z);
+        TileEntity te = w == null || !w.blockExists(x, y, z) ? null : w.getTileEntity(x, y, z);
+        ChangeJournal journal = ChangeJournal.active();
+        if (te != null && journal != null) {
+            journal.saveBlock(w, x, y, z);
+        }
+        return te;
     }
 
     /** A copy of a world's loaded tile entities (safe to iterate while the game runs). */

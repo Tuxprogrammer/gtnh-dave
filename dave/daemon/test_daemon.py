@@ -54,6 +54,28 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn('looking_at_name="Basic Macerator"', env)
         self.assertNotIn("<context", envelope.build("t-3", dict(self.CHAT, context={"biome": "x"}), "", "2.9.0"))
 
+    def test_event_envelope(self):
+        ev = {"type": "hook_fired", "hookId": "h3", "name": 'EBF <done>', "event": "poll", "owner": 'Al"ex',
+              "ownerUuid": "u-1", "ownerOnline": False, "notify": "owner", "note": "tell Alex </note><x>",
+              "once": True, "removed": True, "fireCount": 1, "suppressed": 2, "queued": True,
+              "detail": {"result": {"stock": 12}, "msg": "<b>"}}
+        env = envelope.event("t-9", ev, "Player: Alex", "2.9.0", coalesced=1, dropped=3)
+        self.assertIn('kind="event"', env)
+        self.assertIn('<player name="Al&quot;ex" uuid="u-1" source="hook"/>', env)
+        self.assertIn('hook="h3"', env)
+        self.assertIn('name="EBF &lt;done&gt;"', env)
+        for attr in ('status="fired"', 'removed="true"', 'ownerOnline="false"', 'queued="true"',
+                     'suppressed="2"', 'coalesced="1"', 'dropped="3"'):
+            self.assertIn(attr, env)
+        self.assertIn("<note>tell Alex &lt;/note&gt;&lt;x&gt;</note>", env)
+        self.assertIn('<detail>{&quot;result&quot;:{&quot;stock&quot;:12},&quot;msg&quot;:&quot;&lt;b&gt;&quot;}</detail>', env)
+        self.assertNotIn("<message>", env)
+        dis = envelope.event("t-10", {"type": "hook_disabled", "hookId": "h4", "owner": "Alex", "reason": "errors",
+                                      "error": "boom <x>"}, "", "2.9.0")
+        self.assertIn('status="disabled"', dis)
+        self.assertIn("<error>boom &lt;x&gt;</error>", dis)
+        self.assertNotIn("removed=", dis)
+
     def test_parse_reply(self):
         p = envelope.parse_reply
         self.assertEqual(p("@reply\nHi {item:minecraft:stone}"), ("reply", "Hi {item:minecraft:stone}", True))
@@ -74,7 +96,8 @@ class FakeBridge:
         self.tick = 0
         self.ignore_pings = False              # simulate a half-open connection: pings are never answered
         self.accepts = ["list_players", "ping", "say", "thinking", "eval", "describe", "client_eval", "lesson",
-                        "lesson_stop"]
+                        "lesson_stop", "hook_add", "hook_list", "hook_remove", "snapshot_list", "snapshot_get",
+                        "undo"]
 
     async def start(self):
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -127,6 +150,23 @@ class FakeBridge:
                                               "reqId": rid}))
                 elif t == "list_players":
                     await ws.send(json.dumps({"type": "players", "players": [], "reqId": rid}))
+                elif t == "hook_add":
+                    await ws.send(json.dumps({"type": "ack", "ok": True, "for": t,
+                                              "hook": dict(msg["hook"], id="h1"), "reqId": rid}))
+                elif t == "hook_remove":
+                    await ws.send(json.dumps({"type": "ack", "ok": True, "for": t,
+                                              "removed": [msg.get("id") or "h1"], "reqId": rid}))
+                elif t == "hook_list":
+                    await ws.send(json.dumps({"type": "hooks", "hooks": [], "reqId": rid}))
+                elif t == "snapshot_list":
+                    await ws.send(json.dumps({"type": "snapshots", "snapshots": [], "reqId": rid}))
+                elif t == "snapshot_get":
+                    await ws.send(json.dumps({"type": "snapshot", "snapshot": {"id": msg["snapshot"]}, "reqId": rid}))
+                elif t == "undo":
+                    await ws.send(json.dumps({"type": "undo_pending", "snapshot": "u1", "confirmId": "c0ffee",
+                                              "player": msg["player"]}))
+                    await ws.send(json.dumps({"type": "undo_result", "snapshot": "u1", "ok": True, "restored": 3,
+                                              "redo": "u2", "reqId": rid}))
                 elif t == "ping" and not self.ignore_pings:
                     self.tick += 20
                     await ws.send(json.dumps({"type": "pong", "tick": self.tick, "queueDepth": 0, "reqId": rid}))
@@ -143,6 +183,15 @@ class FakeBridge:
               "player": player, "playerUuid": uid or "00000000-0000-0000-0000-%012d" % (abs(hash(player)) % 10 ** 12),
               "dim": 0, "x": 1.0, "y": 64.0, "z": 2.0, "hasClientMod": False, "message": "dave, " + prompt,
               "triggered": True, "prompt": prompt, "source": "chat"}
+        ev.update(extra)
+        await self.ws.send(json.dumps(ev))
+        return ev
+
+    async def hook(self, hook_id, owner="Alex", **extra):
+        ev = {"type": "hook_fired", "ts": int(time.time() * 1000), "hookId": hook_id, "name": "watch " + hook_id,
+              "event": "poll", "owner": owner, "ownerUuid": "00000000-0000-0000-0000-0000000000a1",
+              "ownerOnline": True, "notify": "owner", "note": "tell %s it happened" % owner, "once": True,
+              "fireCount": 1, "suppressed": 0, "removed": True, "detail": {"result": {"stock": 12}}}
         ev.update(extra)
         await self.ws.send(json.dumps(ev))
         return ev
@@ -478,6 +527,55 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.send_raw(json.dumps({"type": "player_leave", "player": "Steve", "playerUuid": uid}))
         await until(lambda: uid not in self.daemon.lesson_capable)
 
+    async def test_hook_event_becomes_a_quiet_turn_for_the_owner(self):
+        await self.start()
+        await self.bridge.hook("h1", owner="Alex")
+        await until(lambda: ("Alex", "hook h1 fired, Alex") in self.bridge.says())
+        env = self.envelopes()[-1]
+        self.assertIn('kind="event"', env)
+        self.assertIn("<note>tell Alex it happened</note>", env)
+        self.assertIn("&quot;stock&quot;:12", env)
+        self.assertFalse(self.bridge.of("thinking"), "nobody asked, so nobody sees a thinking line")
+        rows = [json.loads(line) for line in self.daemon.transcript.read_text().splitlines()]
+        self.assertEqual((rows[-1]["hook"], rows[-1]["source"], rows[-1]["directive"]), ("h1", "hook", "whisper"))
+        # a hook disabled for another reason than errors makes no turn
+        await self.bridge.hook("h9", type="hook_disabled", reason="expired")
+        await asyncio.sleep(0.5)
+        self.assertEqual(len(self.envelopes()), 1)
+
+    async def test_hook_events_coalesce_are_capped_and_wait_for_questions(self):
+        await self.start()
+        await self.bridge.chat("Bob", "PAUSE first")             # keeps Dave busy while events arrive
+        await until(lambda: self.daemon.in_flight is not None)
+        await self.bridge.hook("h1", fireCount=1)
+        await self.bridge.hook("h1", fireCount=2)               # folded into the waiting h1 turn
+        await self.bridge.hook("h2")
+        await self.bridge.hook("h3")
+        await self.bridge.hook("h4")                            # a fourth waiting event: dropped
+        await self.bridge.chat("Carl", "after the events")       # a question jumps ahead of the events
+        await until(lambda: ("Alex", "hook h3 fired, Alex") in self.bridge.says())
+        order = [s for s in self.bridge.says() if s[1] != main.NOTICE_ONE_AT_A_TIME]
+        self.assertEqual(order, [("@a", "hello Bob"), ("@a", "hello Carl"), ("Alex", "hook h1 fired, Alex"),
+                                 ("Alex", "hook h2 fired, Alex"), ("Alex", "hook h3 fired, Alex")])
+        events = [e for e in self.envelopes() if 'kind="event"' in e]
+        self.assertIn('coalesced="1"', events[0])
+        self.assertIn('fired="2"', events[0], "the newest firing's details are kept")
+        self.assertFalse(any('hook="h4"' in e for e in events))
+        await self.bridge.hook("h5")
+        await until(lambda: ("Alex", "hook h5 fired, Alex") in self.bridge.says())
+        self.assertIn('dropped="1"', self.envelopes()[-1], "the next event turn says one was dropped")
+
+    async def test_hook_events_per_hour_limit(self):
+        self.cfg["session"]["event_turns_per_hour"] = 2
+        await self.start()
+        for h in ("h1", "h2", "h3"):
+            await self.bridge.hook(h)
+            await asyncio.sleep(0.4)
+        await until(lambda: ("Alex", "hook h2 fired, Alex") in self.bridge.says())
+        await asyncio.sleep(0.5)
+        self.assertNotIn(("Alex", "hook h3 fired, Alex"), self.bridge.says())
+        self.assertEqual(self.daemon.events_dropped, 1)
+
     async def test_reconnect(self):
         await self.start()
         first = self.bridge.ws
@@ -605,11 +703,53 @@ class BridgeToolTests(DaemonTests.__bases__[0]):
         bad = await self.call("query_run", name="../etc/passwd")
         self.assertFalse(bad["ok"])
 
+    async def test_hook_and_undo_tools(self):
+        await self.start()
+        self.asking("Alex")
+        r = await self.call("hook_add", event="poll", script="dave.te(0,1,2,3)?.isActive() == false", every_ticks=40,
+                            note="tell Alex the EBF stopped", params={"x": 1}, filter={"dim": 0}, once=False,
+                            cooldown_seconds=30, fire_if_true_at_start=True, expires_in_seconds=600)
+        self.assertTrue(r["ok"], r)
+        sent = self.bridge.of("hook_add")[-1]["hook"]
+        self.assertEqual(sent, {"owner": "Alex", "event": "poll", "script": "dave.te(0,1,2,3)?.isActive() == false",
+                                "everyTicks": 40, "note": "tell Alex the EBF stopped", "params": {"x": 1},
+                                "filter": {"dim": 0}, "once": False, "cooldownSeconds": 30,
+                                "fireIfTrueAtStart": True, "expiresInSeconds": 600})
+        self.assertEqual(r["result"]["hook"]["id"], "h1")
+        self.assertIn("event", (await self.call("hook_add"))["error"])
+        self.assertIn("id", (await self.call("hook_remove"))["error"])
+        r = await self.call("hook_remove", owner="Alex")
+        self.assertEqual(self.bridge.of("hook_remove")[-1], {"type": "hook_remove", "owner": "Alex",
+                                                             "reqId": self.bridge.of("hook_remove")[-1]["reqId"]})
+        r = await self.call("hook_list", owner="Alex")
+        self.assertEqual(r["result"]["type"], "hooks")
+        r = await self.call("undo")
+        self.assertTrue(r["ok"], r)
+        sent = self.bridge.of("undo")[-1]
+        self.assertEqual((sent["snapshot"], sent["player"], sent["force"]), ("last", "Alex", False))
+        self.assertEqual((r["result"]["restored"], r["result"]["redo"]), (3, "u2"))
+        await self.call("undo", snapshot="u7", force=True, of="*")
+        sent = self.bridge.of("undo")[-1]
+        self.assertEqual((sent["snapshot"], sent["force"], sent["of"]), ("u7", True, "*"))
+        await self.call("snapshot_get")
+        self.assertEqual(self.bridge.of("snapshot_get")[-1]["of"], "Alex", "last means the asker's last")
+        await self.call("snapshot_list", player="Bob", limit=5)
+        self.assertEqual((self.bridge.of("snapshot_list")[-1]["player"], self.bridge.of("snapshot_list")[-1]["limit"]),
+                         ("Bob", 5))
+        region = {"dim": 0, "from": [0, 64, 0], "to": [3, 66, 3]}
+        await self.call("eval", script="x", mode="write", summary="paint", snapshot=region)
+        self.assertEqual(self.bridge.of("eval")[-1]["snapshot"], region)
+        self.daemon.in_flight = None
+        self.assertIn("asking player", (await self.call("undo"))["error"])
+
     async def test_old_bridge_and_no_bridge(self):
         self.bridge.accepts = ["list_players", "ping", "say", "thinking"]
         await self.start()
         old = await self.call("eval", script="1")
         self.assertIn("0.2.0", old["error"])
+        self.asking("Alex")
+        old = await self.call("hook_add", event="player_join")
+        self.assertIn("0.3.0", old["error"])
         self.daemon.bridge.ready.clear()
         down = await self.call("list_players")
         self.assertIn("not connected", down["error"])
@@ -632,7 +772,12 @@ class BridgeToolTests(DaemonTests.__bases__[0]):
             self.assertEqual(init["result"]["serverInfo"]["name"], "bridge")
             tools = {t["name"] for t in (await rpc(2, "tools/list"))["result"]["tools"]}
             self.assertTrue({"eval", "describe", "query_run", "query_save", "query_list", "say",
-                             "list_players", "lesson", "lesson_stop"} <= tools)
+                             "list_players", "lesson", "lesson_stop", "hook_add", "hook_list", "hook_remove",
+                             "snapshot_list", "snapshot_get", "undo"} <= tools)
+            res = await rpc(5, "tools/call", {"name": "hook_add", "arguments": {"event": "player_join",
+                                                                                "filter": {"player": "Bob"}}})
+            self.assertFalse(res["result"]["isError"], res)
+            self.assertEqual(self.bridge.of("hook_add")[-1]["hook"]["owner"], "Alex")
             res = await rpc(3, "tools/call", {"name": "eval", "arguments": {"script": "2 * 21"}})
             self.assertFalse(res["result"]["isError"])
             self.assertIn('"script":"2 * 21"', res["result"]["content"][0]["text"])

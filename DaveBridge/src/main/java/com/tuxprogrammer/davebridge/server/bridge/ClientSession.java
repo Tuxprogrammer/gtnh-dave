@@ -56,7 +56,7 @@ public final class ClientSession {
         sendRaw(message.toString());
     }
 
-    void sendRaw(String text) {
+    public void sendRaw(String text) {
         try {
             if (conn.isOpen()) {
                 conn.send(text);

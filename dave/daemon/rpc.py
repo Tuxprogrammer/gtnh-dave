@@ -23,6 +23,7 @@ from dave.bridge.queries import QueryError, Queries
 log = logging.getLogger("dave")
 
 MAX_LINE = 1024 * 1024
+NEEDS_030 = {"hook_add", "hook_list", "hook_remove", "snapshot_list", "snapshot_get", "undo"}
 
 
 class RpcError(Exception):
@@ -120,8 +121,9 @@ class BridgeRPC:
             raise RpcError("DaveBridge is not connected right now")
         accepts = (bridge.hello or {}).get("accepts") or []
         if msg["type"] not in accepts:
-            raise RpcError("this server's DaveBridge does not support %s (it needs DaveBridge 0.2.0 or newer)"
-                           % msg["type"])
+            need = "0.3.0" if msg["type"] in NEEDS_030 else "0.2.0"
+            raise RpcError("this server's DaveBridge does not support %s (it needs DaveBridge %s or newer)"
+                           % (msg["type"], need))
         try:
             reply = await bridge.request(msg, timeout=timeout)
         except BridgeDown as e:
@@ -165,6 +167,39 @@ class BridgeRPC:
             if a.get("id"):
                 msg["id"] = str(a["id"])
             return await self.request(msg, timeout=10)
+        if op == "hook_add":
+            return await self.hook_add(a)
+        if op == "hook_list":
+            msg = {"type": "hook_list"}
+            if a.get("owner"):
+                msg["owner"] = a["owner"]
+            return await self.request(msg, timeout=30)
+        if op == "hook_remove":
+            if not a.get("id") and not a.get("owner"):
+                raise RpcError("hook_remove needs id (one hook) or owner (all of that player's hooks)")
+            msg = {"type": "hook_remove"}
+            msg.update({"id": str(a["id"])} if a.get("id") else {"owner": a["owner"]})
+            return await self.request(msg, timeout=30)
+        if op == "snapshot_list":
+            msg = {"type": "snapshot_list", "limit": int(a.get("limit") or 20)}
+            if a.get("player"):
+                msg["player"] = a["player"]
+            return await self.request(msg, timeout=30)
+        if op == "snapshot_get":
+            msg = {"type": "snapshot_get", "snapshot": str(a.get("snapshot") or "last")}
+            msg["of"] = a.get("of") or self.asker() or "*"
+            return await self.request(msg, timeout=30)
+        if op == "undo":
+            player = a.get("player") or self.asker()
+            if not player:
+                raise RpcError("undo needs the asking player, who confirms it in chat")
+            confirm = int(a.get("confirm_timeout_seconds") or 120)
+            msg = {"type": "undo", "snapshot": str(a.get("snapshot") or "last"), "player": player,
+                   "force": bool(a.get("force")), "confirmTimeoutSeconds": confirm}
+            if a.get("of"):
+                msg["of"] = a["of"]
+            # the player's click, then the restore over a few ticks
+            return await self.request(msg, timeout=confirm + 180)
         if op == "query_list":
             return {"queries": [{k: q.get(k) for k in ("name", "description", "mode", "side", "params", "origin")}
                                 for q in self.queries.list()]}
@@ -184,6 +219,26 @@ class BridgeRPC:
             reply["query"] = q["name"]
             return reply
         raise RpcError("unknown op %r" % (op,))
+
+    # Tool argument names (snake_case) -> the hook object's fields (DaveBridge PROTOCOL.md 1.9).
+    HOOK_FIELDS = {"event": "event", "name": "name", "note": "note", "notify": "notify", "script": "script",
+                   "params": "params", "filter": "filter", "every_ticks": "everyTicks", "once": "once",
+                   "cooldown_seconds": "cooldownSeconds", "edge": "edge",
+                   "fire_if_true_at_start": "fireIfTrueAtStart", "expires_in_seconds": "expiresInSeconds"}
+
+    async def hook_add(self, a):
+        """The owner defaults to the asker: the player the hook reports back to."""
+        if not a.get("event"):
+            raise RpcError("hook_add needs event (player_join, player_leave, player_death, player_dimension, "
+                           "entity_death, block_break, block_place, chat, quest_complete or poll)")
+        owner = a.get("owner") or self.asker()
+        if not owner:
+            raise RpcError("hook_add needs an owner: the player the hook is for (default: the asker)")
+        hook = {"owner": owner}
+        for k_in, k_out in self.HOOK_FIELDS.items():
+            if a.get(k_in) is not None:
+                hook[k_out] = a[k_in]
+        return await self.request({"type": "hook_add", "hook": hook}, timeout=60)
 
     async def eval(self, a):
         script = a.get("script")
@@ -213,6 +268,8 @@ class BridgeRPC:
                 if not (a.get("summary") or "").strip():
                     raise RpcError("a write needs summary: one line telling the player what will change")
                 msg["summary"] = a["summary"]
+                if a.get("snapshot"):
+                    msg["snapshot"] = a["snapshot"]   # regions to save for undo before it runs
                 confirm = int(a.get("confirm_timeout_seconds") or 120)
                 msg["confirmTimeoutSeconds"] = confirm
                 wait = confirm + 60

@@ -63,6 +63,11 @@ public final class BqQuests {
         return find(ref, Impl.SOURCE);
     }
 
+    /** A quest's server-side name, or null when there is no such quest. Only call when {@link #available()}. */
+    public static String nameOf(UUID id) {
+        return Impl.SOURCE.nameOf(id);
+    }
+
     /** The quest database as {@link #find(String, Source)} needs it; faked in tests. */
     interface Source {
 

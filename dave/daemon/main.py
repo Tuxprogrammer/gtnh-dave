@@ -424,14 +424,25 @@ class Claude:
 # ------------------------------------------------------------------------------------------------ daemon
 
 class Turn:
-    def __init__(self, chat):
+    def __init__(self, chat, event=None):
         self.chat = chat
+        self.event = event                     # a hook_fired / hook_disabled message: an event turn, nobody asked
+        self.coalesced = 0                     # later firings of the same hook folded into this turn
+        self.dropped = 0                       # event turns dropped by the rate limit before this one
         self.player = chat.get("player") or "?"
         self.uuid = chat.get("playerUuid") or ""
-        # The per-player cap and cooldown key: the UUID, or the name when the bridge sent no UUID.
-        self.key = self.uuid or "name:" + self.player.lower()
+        # The per-player cap and cooldown key: the UUID, or the name when the bridge sent no UUID. Event turns have
+        # their own key per hook, so a hook never counts against its owner's questions.
+        self.key = ("event:" + str(event.get("hookId"))) if event else (self.uuid or "name:" + self.player.lower())
         self.enqueued = time.monotonic()
         self.id = "t-" + uuidlib.uuid4().hex[:10]
+
+    @classmethod
+    def for_event(cls, ev):
+        """An event turn: the hook's owner stands in for the asker (replies, whispers and confirms go to them)."""
+        chat = {"player": ev.get("owner") or "?", "playerUuid": ev.get("ownerUuid") or "", "source": "hook",
+                "triggered": False, "message": ev.get("note") or ev.get("name") or ""}
+        return cls(chat, event=ev)
 
 
 class Daemon:
@@ -442,6 +453,8 @@ class Daemon:
         self.turn_timeout, self.followup_timeout = s("turn_timeout_seconds", 600), s("followup_timeout_seconds", 900)
         self.cooldown, self.max_per_player = s("cooldown_seconds", 4, float), s("max_per_player", 2)
         self.max_queue, self.stale = s("max_queue", 10), s("stale_seconds", 300, float)
+        self.event_max_queued, self.event_per_hour = s("event_max_queued", 3), s("event_turns_per_hour", 30)
+        self.event_stale = s("event_stale_seconds", 1800, float)
         self.default_target = cfg.get("session", {}).get("default_target", "reply")
         self.pack = cfg["pack"]["version"]
         token, src = config.secret(cfg, "bridge_token")
@@ -461,6 +474,8 @@ class Daemon:
         self.lesson_status = {}                # uuid -> last lesson_status event (how their last lesson ended)
         self.warnings = []                     # (turn id, text) from the last say ack, for the next turn
         self.recent = collections.deque(maxlen=6)
+        self.event_times = collections.deque()  # monotonic times of event turns accepted in the last hour
+        self.events_dropped = 0                # dropped since the last accepted event turn (told to Dave then)
         self.fresh_session = True              # next turn is the first of a session: add <recent>
         self.last_turn = None                  # the turn a late (background) result belongs to
         logs = log_dir(cfg)
@@ -492,6 +507,44 @@ class Daemon:
             log.info("server stopping; waiting for it to come back")
         elif t == "eval_pending":
             log.info("eval %s waits for %s to confirm: %s", ev.get("confirmId"), ev.get("player"), ev.get("summary"))
+        elif t == "undo_pending":
+            log.info("undo of %s waits for %s to confirm (%s)", ev.get("snapshot"), ev.get("player"),
+                     ev.get("confirmId"))
+        elif t in ("hook_fired", "hook_disabled"):
+            self.on_hook(ev)
+
+    def on_hook(self, ev):
+        """A hook fired (or was disabled): queue an event turn for Dave, coalesced and rate-limited.
+
+        A second firing of a hook whose turn is still waiting replaces it (newest detail) and is counted. Event turns
+        are capped at event_max_queued waiting and event_turns_per_hour; extra ones are dropped and the next event
+        turn says how many. Player questions always go first (see next_turn)."""
+        if ev.get("type") == "hook_disabled" and ev.get("reason") not in (None, "errors"):
+            log.info("hook %s disabled (%s)", ev.get("hookId"), ev.get("reason"))
+            return
+        log.info("hook %s (%s) %s for %s", ev.get("hookId"), ev.get("name"),
+                 "disabled" if ev.get("type") == "hook_disabled" else "fired", ev.get("owner"))
+        for q in self.queue:
+            if q.event is not None and q.event.get("hookId") == ev.get("hookId") \
+                    and q.event.get("type") == ev.get("type"):
+                q.event = ev
+                q.coalesced += 1
+                return
+        now = time.monotonic()
+        while self.event_times and now - self.event_times[0] > 3600:
+            self.event_times.popleft()
+        waiting = sum(1 for q in self.queue if q.event is not None)
+        if waiting >= self.event_max_queued or len(self.event_times) >= self.event_per_hour \
+                or len(self.queue) >= self.max_queue:
+            self.events_dropped += 1
+            log.warning("dropping hook event %s (%d waiting, %d this hour)", ev.get("hookId"), waiting,
+                        len(self.event_times))
+            return
+        self.event_times.append(now)
+        turn = Turn.for_event(ev)
+        turn.dropped, self.events_dropped = self.events_dropped, 0
+        self.queue.append(turn)
+        self.wakeup.set()
 
     async def on_chat(self, ev):
         if not ev.get("triggered"):
@@ -528,11 +581,15 @@ class Daemon:
                 await self.wakeup.wait()
                 continue
             await self.bridge.ready.wait()
-            turn = self.queue.popleft()
+            turn = self.next_turn()
             # Only time spent waiting while Dave was free counts (i.e. the bridge was down): a question queued
             # behind a long planner turn is not stale.
             waited = time.monotonic() - max(turn.enqueued, self.free_since)
-            if waited > self.stale:
+            if turn.event is not None:
+                if waited > self.event_stale:
+                    log.info("dropping stale hook event %s (waited %.0f s)", turn.event.get("hookId"), waited)
+                    continue
+            elif waited > self.stale:
                 log.info("dropping stale question from %s (waited %.0f s for the bridge)", turn.player, waited)
                 await self.bridge.notice(turn.player, NOTICE_STALE)
                 continue
@@ -541,10 +598,25 @@ class Daemon:
                 await self.run_turn(turn)
             except Exception:
                 log.exception("turn %s failed", turn.id)
-                await self.bridge.notice(turn.player, NOTICE_ERROR)
+                await self.tell(turn, NOTICE_ERROR)
             finally:
                 self.in_flight = None
                 self.free_since = time.monotonic()
+
+    async def tell(self, turn, text):
+        """A failure notice to the asker. Event turns had no asker, so their failures are only logged."""
+        if turn.event is None:
+            await self.bridge.notice(turn.player, text)
+        else:
+            log.warning("hook event turn %s failed: %s", turn.id, text)
+
+    def next_turn(self):
+        """The oldest player question, else the oldest event turn: a hook never makes a player wait."""
+        for i, q in enumerate(self.queue):
+            if q.event is None:
+                del self.queue[i]
+                return q
+        return self.queue.popleft()
 
     async def ensure_claude(self):
         age_h = (time.monotonic() - self.claude.started) / 3600
@@ -565,11 +637,15 @@ class Daemon:
         await self.ensure_claude()
         chat = turn.chat
         prompt = chat.get("prompt") if chat.get("triggered") else chat.get("message")
-        if turn.uuid:
+        if turn.uuid and turn.event is None:
             await asyncio.to_thread(self.store.ensure_player, turn.uuid, turn.player, "daemon")
         profile = await asyncio.to_thread(memstore.load_turn_context, turn.uuid, prompt, turn.player, 1500, self.store)
-        content = envelope.build(turn.id, chat, profile, self.pack, client_eval=self.client_eval.get(turn.uuid),
-                                 warnings=self.warnings, recent=list(self.recent) if self.fresh_session else None)
+        if turn.event is not None:
+            content = envelope.event(turn.id, turn.event, profile, self.pack, coalesced=turn.coalesced,
+                                     dropped=turn.dropped)
+        else:
+            content = envelope.build(turn.id, chat, profile, self.pack, client_eval=self.client_eval.get(turn.uuid),
+                                     warnings=self.warnings, recent=list(self.recent) if self.fresh_session else None)
         previous = self.last_turn
         self.warnings, self.fresh_session, self.last_turn = [], False, turn
         self.claude.busy = True
@@ -584,7 +660,9 @@ class Daemon:
             self.claude.busy = False
 
     async def _run_turn_owned(self, turn, content):
-        heartbeat = asyncio.create_task(self._thinking_heartbeat(turn.player))
+        # Nobody asked for an event turn, so nobody gets a thinking indicator.
+        quiet = turn.event is not None
+        heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn.player))
         started = time.monotonic()
         try:
             result = await self._ask_with_recovery(turn, content)
@@ -595,7 +673,7 @@ class Daemon:
         await self.deliver(turn, result, started=started)
         while self.claude.background > 0 and self.claude.alive:
             log.info("background agent running for %s; holding the queue for its follow-up", turn.player)
-            heartbeat = asyncio.create_task(self._thinking_heartbeat(turn.player))
+            heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn.player))
             try:
                 follow = await self.claude.wait_followup(self.followup_timeout)
             except (asyncio.TimeoutError, ClaudeDied) as e:
@@ -613,7 +691,7 @@ class Daemon:
             return await self.claude.ask(content, self.turn_timeout)
         except asyncio.TimeoutError:
             log.warning("turn %s timed out after %ss; restarting the session", turn.id, self.turn_timeout)
-            await self.bridge.notice(turn.player, NOTICE_TIMEOUT)
+            await self.tell(turn, NOTICE_TIMEOUT)
             await self.claude.stop(graceful=False)
             self.fresh_session = True
             return None
@@ -636,20 +714,21 @@ class Daemon:
                 log.warning("retry failed (%s); starting a fresh session", e2)
                 await self.claude.stop()
                 self.fresh_session = True
-                await self.bridge.notice(turn.player, NOTICE_CRASH)
+                await self.tell(turn, NOTICE_CRASH)
                 return None
 
     async def _thinking_heartbeat(self, player):
         while True:
             await asyncio.sleep(45)               # the client half drops the line after 60 s
-            await self.bridge.thinking(player)
+            if player:
+                await self.bridge.thinking(player)
 
     async def deliver(self, turn, result, started=None, late=False):
         text = result.get("result") or ""
         if result.get("is_error") or result.get("subtype", "success") != "success":
             limit = "limit" in text.lower() or "usage" in text.lower()
             log.warning("turn %s ended with %s: %s", turn.id, result.get("subtype"), text[:300])
-            await self.bridge.notice(turn.player, NOTICE_LIMIT if limit else NOTICE_ERROR)
+            await self.tell(turn, NOTICE_LIMIT if limit else NOTICE_ERROR)
             self._record(turn, result, "error", text, None, started, late)
             return
         directive, markup, had = envelope.parse_reply(text, self.default_target)
@@ -675,6 +754,7 @@ class Daemon:
     def _record(self, turn, result, directive, reply, ack, started, late):
         row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn": turn.id, "player": turn.player, "uuid": turn.uuid,
                "source": turn.chat.get("source"), "prompt": turn.chat.get("prompt") or turn.chat.get("message"),
+               "hook": turn.event.get("hookId") if turn.event else None,
                "directive": directive, "reply": reply, "late": late,
                "seconds": round(time.monotonic() - started, 1) if started else None,
                "session": result.get("session_id"), "num_turns": result.get("num_turns"),

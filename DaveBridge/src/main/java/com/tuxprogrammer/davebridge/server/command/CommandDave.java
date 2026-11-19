@@ -17,11 +17,14 @@ import com.tuxprogrammer.davebridge.server.DaveServer;
 import com.tuxprogrammer.davebridge.server.bridge.BridgeService;
 import com.tuxprogrammer.davebridge.server.bridge.ClientSession;
 import com.tuxprogrammer.davebridge.server.eval.EvalService;
+import com.tuxprogrammer.davebridge.server.hooks.HookService;
+import com.tuxprogrammer.davebridge.server.undo.UndoService;
 
 /**
- * {@code /dave status} and {@code /dave reload} (ops only, permission level 3), and {@code /dave confirm|cancel <id>},
- * the targets of the Confirm and Cancel buttons for world-changing scripts, which any player may run (only the asked
- * player's click counts; see {@code EvalService}).
+ * {@code /dave status}, {@code reload}, {@code pending}, {@code ask}, {@code hooks} and {@code snapshots} (ops only,
+ * permission level 3), {@code /dave confirm|cancel <id>}, the targets of the Confirm and Cancel buttons for
+ * world-changing scripts, which any player may run (only the asked player's click counts; see {@code Confirms}), and
+ * {@code /dave undo}, which any player may run on their own confirmed changes (the [Undo] button) and ops on any.
  */
 public class CommandDave extends CommandBase {
 
@@ -32,7 +35,8 @@ public class CommandDave extends CommandBase {
 
     @Override
     public String getCommandUsage(ICommandSender sender) {
-        return "/dave <status|reload|pending|ask <asName> [@x,y,z,dim] <question>|confirm <id>|cancel <id>>";
+        return "/dave <status|reload|pending|ask <asName> [@x,y,z,dim] <question>|confirm <id>|cancel <id>|hooks [owner]"
+            + "|hooks remove|fire <id>|snapshots [player]|undo <id|last> [player] [force]>";
     }
 
     /** Everyone may run the command; status and reload check for op level 3 themselves. */
@@ -56,7 +60,25 @@ public class CommandDave extends CommandBase {
             sender.addChatMessage(EvalService.onConfirmCommand(sender, args[1], "confirm".equalsIgnoreCase(sub)));
             return;
         }
-        if (!sender.canCommandSenderUseCommand(getRequiredPermissionLevel(), getCommandName())) {
+        boolean op = sender.canCommandSenderUseCommand(getRequiredPermissionLevel(), getCommandName());
+        if ("undo".equalsIgnoreCase(sub)) {
+            // Any player may undo their own confirmed change (the [Undo] button); ops and the console any.
+            if (args.length < 2) {
+                throw new WrongUsageException("/dave undo <id|last> [player] [force]");
+            }
+            String of = null;
+            boolean force = false;
+            for (int i = 2; i < args.length; i++) {
+                if ("force".equalsIgnoreCase(args[i])) {
+                    force = true;
+                } else {
+                    of = args[i];
+                }
+            }
+            sender.addChatMessage(UndoService.command(sender, op, args[1], of, force));
+            return;
+        }
+        if (!op) {
             throw new net.minecraft.command.CommandException("commands.generic.permission");
         }
         if ("status".equalsIgnoreCase(sub)) {
@@ -87,6 +109,24 @@ public class CommandDave extends CommandBase {
             send(sender, lines.size() + " change(s) waiting for a confirm", EnumChatFormatting.AQUA);
             for (String line : lines) {
                 send(sender, " " + line, null);
+            }
+        } else if ("hooks".equalsIgnoreCase(sub)) {
+            if (args.length >= 3 && "remove".equalsIgnoreCase(args[1])) {
+                send(sender, HookService.removeCommand(args[2]), EnumChatFormatting.GRAY);
+            } else if (args.length >= 3 && "fire".equalsIgnoreCase(args[1])) {
+                send(sender, HookService.fireCommand(args[2]), EnumChatFormatting.GRAY);
+            } else {
+                List<String> lines = HookService.describe(args.length >= 2 ? args[1] : null);
+                send(sender, lines.get(0), EnumChatFormatting.AQUA);
+                for (int i = 1; i < lines.size(); i++) {
+                    send(sender, " " + lines.get(i), null);
+                }
+            }
+        } else if ("snapshots".equalsIgnoreCase(sub)) {
+            List<String> lines = UndoService.describeList(args.length >= 2 ? args[1] : null, 15);
+            send(sender, lines.get(0), EnumChatFormatting.AQUA);
+            for (int i = 1; i < lines.size(); i++) {
+                send(sender, " " + lines.get(i), null);
             }
         } else {
             throw new WrongUsageException(getCommandUsage(sender));
@@ -128,6 +168,8 @@ public class CommandDave extends CommandBase {
             null);
         send(sender, " Players with the client mod: " + DaveServer.CLIENTS.count(), null);
         send(sender, " Changes waiting for a confirm: " + EvalService.pendingConfirms(), null);
+        send(sender, " Hooks: " + HookService.count() + (Config.hooksEnabled ? "" : " (disabled)"), null);
+        send(sender, " Undo: " + (UndoService.ready() ? "on" : "off"), null);
     }
 
     private static void send(ICommandSender sender, String text, EnumChatFormatting color) {
@@ -140,6 +182,8 @@ public class CommandDave extends CommandBase {
 
     @Override
     public List<String> addTabCompletionOptions(ICommandSender sender, String[] args) {
-        return args.length == 1 ? getListOfStringsMatchingLastWord(args, "status", "reload", "pending", "ask") : null;
+        return args.length == 1
+            ? getListOfStringsMatchingLastWord(args, "status", "reload", "pending", "ask", "hooks", "snapshots", "undo")
+            : null;
     }
 }

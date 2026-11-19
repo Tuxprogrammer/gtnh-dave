@@ -1,20 +1,21 @@
 package com.tuxprogrammer.davebridge.server.eval;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-import net.minecraft.command.ICommandSender;
 import net.minecraft.entity.player.EntityPlayerMP;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.ChatComponentText;
-import net.minecraft.util.ChatStyle;
-import net.minecraft.util.EnumChatFormatting;
 import net.minecraft.util.IChatComponent;
 import net.minecraft.world.World;
 import net.minecraftforge.common.DimensionManager;
@@ -35,26 +36,41 @@ import com.tuxprogrammer.davebridge.server.bridge.Protocol;
 import com.tuxprogrammer.davebridge.server.bridge.ProtocolException;
 import com.tuxprogrammer.davebridge.server.bridge.Request;
 import com.tuxprogrammer.davebridge.server.chat.DaveChat;
-import com.tuxprogrammer.davebridge.server.chat.markup.ChatStyles;
 import com.tuxprogrammer.davebridge.server.command.TestHooks;
+import com.tuxprogrammer.davebridge.server.undo.ChangeJournal;
+import com.tuxprogrammer.davebridge.server.undo.ScriptUndo;
+import com.tuxprogrammer.davebridge.server.undo.SnapshotMeta;
+import com.tuxprogrammer.davebridge.server.undo.UndoService;
 
 /**
  * Agent requests for live eval (PROTOCOL.md 1.8): {@code eval} and {@code describe}.
  * <p>
  * An {@code eval} is compiled on a background thread, then run on the server thread through the main-thread queue,
  * so it sees a consistent world and its time limit bounds how long it holds the tick. A {@code mode:"write"} script
- * first waits for the asking player to click Confirm in chat ({@link PendingConfirms}); a {@code mode:"read"}
- * script that obviously changes the world is refused with {@code needs_confirm}. Script failures are reported as
- * {@code eval_result} with {@code ok:false}; they never reach the server.
+ * first waits for the asking player to click Confirm in chat ({@link Confirms}); a {@code mode:"read"} script that
+ * obviously changes the world is refused with {@code needs_confirm}. A confirmed write runs inside a change journal
+ * ({@link ChangeJournal}), so it can be undone. Script failures are reported as {@code eval_result} with
+ * {@code ok:false}; they never reach the server.
  */
 public final class EvalService {
 
     static final int MAX_SCRIPT_CHARS = 64 * 1024;
     static final int MAX_SUMMARY_CHARS = 300;
-    static final int MAX_CONFIRMS_PER_PLAYER = 5;
+    static final int MAX_CONFIRMS_PER_PLAYER = Confirms.MAX_PER_PLAYER;
+    static final int MAX_REGIONS = 16;
+
+    /** Mutators the block journal sees (World.setBlock and what calls it); the others need an explicit save. */
+    static final Set<String> JOURNALED = new HashSet<>(
+        Arrays.asList(
+            "setBlock",
+            "func_147449_b",
+            "func_147465_d",
+            "setBlockToAir",
+            "func_147468_f",
+            "func_147480_a",
+            "breakBlock"));
 
     private static final Gson GSON = new Gson();
-    private static final PendingConfirms<WriteJob> CONFIRMS = new PendingConfirms<>(MAX_CONFIRMS_PER_PLAYER);
     private static final ScheduledExecutorService TIMER = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "DaveBridge-eval-timer");
         t.setDaemon(true);
@@ -63,8 +79,27 @@ public final class EvalService {
 
     private EvalService() {}
 
+    /** A cuboid to snapshot before a write runs (the request's {@code snapshot}). */
+    static final class Region {
+
+        final int dim;
+        final int[] from;
+        final int[] to;
+
+        Region(int dim, int[] from, int[] to) {
+            this.dim = dim;
+            this.from = from;
+            this.to = to;
+        }
+
+        long volume() {
+            return (long) (Math.abs(to[0] - from[0]) + 1) * (Math.abs(to[1] - from[1]) + 1)
+                * (Math.abs(to[2] - from[2]) + 1);
+        }
+    }
+
     /** A write-mode script waiting for its confirm. */
-    static final class WriteJob {
+    static final class WriteJob implements Confirms.Job {
 
         final Request request;
         final String id;
@@ -72,15 +107,91 @@ public final class EvalService {
         final Object params;
         final long timeoutMs;
         final String summary;
+        final String script;
+        final List<Region> regions;
 
         WriteJob(Request request, String id, ScriptEngine.Compiled compiled, Object params, long timeoutMs,
-            String summary) {
+            String summary, String script, List<Region> regions) {
             this.request = request;
             this.id = id;
             this.compiled = compiled;
             this.params = params;
             this.timeoutMs = timeoutMs;
             this.summary = summary;
+            this.script = script;
+            this.regions = regions;
+        }
+
+        @Override
+        public String summary() {
+            return summary;
+        }
+
+        @Override
+        public String headline() {
+            return "wants to change the world: ";
+        }
+
+        @Override
+        public String hover() {
+            return "Script:\n" + clip(script, 800);
+        }
+
+        @Override
+        public void confirmed(Confirms.Confirmed by) {
+            runBackupCommand();
+            Ran ran = runConfirmed(this, by.asker);
+            JsonObject r = ran.result;
+            r.addProperty("confirmedBy", by.who);
+            request.reply(r);
+            boolean ok = r.has("ok") && r.get("ok")
+                .getAsBoolean();
+            String outcome = ok ? "Done."
+                : "That change failed: " + clip(
+                    r.get("error")
+                        .getAsString(),
+                    200);
+            SnapshotMeta snap = ran.snapshot;
+            EntityPlayerMP askerPlayer = findPlayer(by.asker);
+            if (askerPlayer != null) {
+                IChatComponent line = DaveChat.notice(outcome);
+                if (snap != null) {
+                    line.appendSibling(new ChatComponentText(" "));
+                    line.appendSibling(UndoService.undoButton(snap));
+                }
+                askerPlayer.addChatMessage(line);
+            }
+            if (by.clicker == null) {
+                by.sender.addChatMessage(
+                    DaveChat.notice(
+                        "Eval " + by.token
+                            + ": "
+                            + outcome
+                            + (snap == null ? "" : " Snapshot " + snap.id + " (/dave undo " + snap.id + ")")));
+            }
+        }
+
+        @Override
+        public void cancelled(String who) {
+            JsonObject r = result(id, "write");
+            r.addProperty("ok", false);
+            r.addProperty("errorType", "cancelled");
+            r.addProperty("error", who + " clicked Cancel; nothing was run");
+            request.reply(r);
+        }
+
+        @Override
+        public void expired(String asker) {
+            JsonObject r = result(id, "write");
+            r.addProperty("ok", false);
+            r.addProperty("errorType", "expired");
+            r.addProperty("error", asker + " did not confirm in time; nothing was run");
+            request.reply(r);
+        }
+
+        @Override
+        public void stopping() {
+            request.error(Protocol.ERR_CANCELLED, "server stopping before the confirm");
         }
     }
 
@@ -120,6 +231,9 @@ public final class EvalService {
         Object params = toJava(
             request.body()
                 .get("params"));
+        List<Region> regions = parseRegions(
+            request.body()
+                .get("snapshot"));
         if ("write".equals(mode)) {
             if (playerName == null) {
                 throw new ProtocolException(
@@ -132,6 +246,8 @@ public final class EvalService {
                     Protocol.ERR_BAD_REQUEST,
                     "mode \"write\" needs \"summary\": one line telling the player what will change");
             }
+        } else if (!regions.isEmpty()) {
+            throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "\"snapshot\" is for mode \"write\" only");
         }
         String summaryText = summary == null ? null : clip(summary.trim(), MAX_SUMMARY_CHARS);
 
@@ -155,25 +271,22 @@ public final class EvalService {
                         return;
                     }
                     if ("write".equals(mode)) {
-                        onMain(
+                        WriteJob job = new WriteJob(
                             request,
-                            "eval_confirm",
-                            () -> askToConfirm(
-                                request,
-                                id,
-                                compiled,
-                                params,
-                                timeoutMs,
-                                playerName,
-                                summaryText,
-                                confirmSeconds,
-                                script));
+                            id,
+                            compiled,
+                            params,
+                            timeoutMs,
+                            summaryText,
+                            script,
+                            regions);
+                        onMain(request, "eval_confirm", () -> askToConfirm(job, playerName, confirmSeconds));
                         return;
                     }
                     router.runOnMainThread(
                         request,
                         "eval",
-                        () -> runNow(id, mode, compiled, params, timeoutMs, playerName, false));
+                        () -> runNow(id, mode, compiled, params, timeoutMs, playerName, false, null));
                 } catch (Throwable t) {
                     DaveBridge.LOG.warn("eval request failed", t);
                     request.error(Protocol.ERR_INTERNAL, t.toString());
@@ -181,15 +294,83 @@ public final class EvalService {
             });
     }
 
+    /** {@code snapshot}: one region object or an array of them, {@code {"dim":0,"from":[x,y,z],"to":[x,y,z]}}. */
+    static List<Region> parseRegions(JsonElement el) throws ProtocolException {
+        List<Region> out = new ArrayList<>();
+        if (el == null || el.isJsonNull()) {
+            return out;
+        }
+        JsonArray list;
+        if (el.isJsonArray()) {
+            list = el.getAsJsonArray();
+        } else if (el.isJsonObject()) {
+            list = new JsonArray();
+            list.add(el);
+        } else {
+            throw new ProtocolException(
+                Protocol.ERR_BAD_REQUEST,
+                "\"snapshot\" must be {\"dim\":0,\"from\":[x,y,z],\"to\":[x,y,z]} or an array of them");
+        }
+        if (list.size() > MAX_REGIONS) {
+            throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "at most " + MAX_REGIONS + " snapshot regions");
+        }
+        long volume = 0;
+        for (JsonElement r : list) {
+            if (!r.isJsonObject()) {
+                throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "each snapshot region must be an object");
+            }
+            JsonObject o = r.getAsJsonObject();
+            int dim = (int) optLong(o, "dim", Integer.MIN_VALUE);
+            Region region = new Region(dim, xyz(o, "from"), xyz(o, "to"));
+            volume += region.volume();
+            out.add(region);
+        }
+        if (volume > Config.undoMaxRegionBlocks) {
+            throw new ProtocolException(
+                Protocol.ERR_BAD_REQUEST,
+                "snapshot regions cover " + volume
+                    + " blocks; at most "
+                    + Config.undoMaxRegionBlocks
+                    + " (undo.undoMaxRegionBlocks)");
+        }
+        return out;
+    }
+
+    private static int[] xyz(JsonObject o, String key) throws ProtocolException {
+        JsonElement el = o.get(key);
+        try {
+            JsonArray a = el.getAsJsonArray();
+            if (a.size() == 3) {
+                return new int[] { (int) Math.floor(
+                    a.get(0)
+                        .getAsDouble()),
+                    (int) Math.floor(
+                        a.get(1)
+                            .getAsDouble()),
+                    (int) Math.floor(
+                        a.get(2)
+                            .getAsDouble()) };
+            }
+        } catch (RuntimeException ignored) {
+            // reported below
+        }
+        throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "snapshot region needs \"" + key + "\": [x,y,z]");
+    }
+
     private static long clampTimeout(long requested) {
         return Math.max(10, Math.min(Config.evalMaxTimeoutMillis, requested));
     }
 
-    /** Runs a compiled script now (server thread) and builds its {@code eval_result}. */
+    /**
+     * Runs a compiled script now (server thread) and builds its {@code eval_result}.
+     *
+     * @param journal the change journal of a confirmed write (bound as {@code undo}), or null
+     */
     static JsonObject runNow(String id, String mode, ScriptEngine.Compiled compiled, Object params, long timeoutMs,
-        String playerName, boolean confirmed) {
+        String playerName, boolean confirmed, ChangeJournal journal) {
         EntityPlayerMP player = playerName == null ? null : findPlayer(playerName);
         Map<String, Object> bindings = bindings(player, playerName, params);
+        bindings.put("undo", new ScriptUndo(journal));
         JsonDump.Limits limits = new JsonDump.Limits(8, 500, 8000, Config.evalMaxResultChars);
         JsonObject outcome = ScriptEngine.shared()
             .run(compiled, bindings, timeoutMs, limits, Config.evalMaxOutputChars);
@@ -206,7 +387,90 @@ public final class EvalService {
         return r;
     }
 
-    static Map<String, Object> bindings(EntityPlayerMP player, String playerName, Object params) {
+    /**
+     * A confirmed write: snapshots the requested regions, runs the script inside a change journal and saves what it
+     * changed as a snapshot (named in the result as {@code snapshot}). Server thread.
+     */
+    static Ran runConfirmed(WriteJob job, String asker) {
+        ChangeJournal journal = UndoService.ready()
+            ? ChangeJournal.begin(Config.undoMaxBlocksPerSnapshot, Config.undoMaxRegionBlocks)
+            : null;
+        JsonObject r;
+        ChangeJournal.Result changes = null;
+        List<String> extra = new ArrayList<>();
+        try {
+            if (journal != null) {
+                EntityPlayerMP player = findPlayer(asker);
+                for (Region region : job.regions) {
+                    int dim = region.dim != Integer.MIN_VALUE ? region.dim : player != null ? player.dimension : 0;
+                    try {
+                        journal.saveRegion(
+                            MinecraftServer.getServer()
+                                .worldServerForDimension(dim),
+                            region.from[0],
+                            region.from[1],
+                            region.from[2],
+                            region.to[0],
+                            region.to[1],
+                            region.to[2]);
+                    } catch (RuntimeException e) {
+                        extra.add("snapshot region not saved: " + e.getMessage());
+                    }
+                }
+            }
+            r = runNow(job.id, "write", job.compiled, job.params, job.timeoutMs, asker, true, journal);
+        } finally {
+            if (journal != null) {
+                changes = journal.end();
+            }
+        }
+        SnapshotMeta snap = null;
+        if (changes != null) {
+            List<String> unseen = new ArrayList<>();
+            for (String m : job.compiled.mutators) {
+                if (!JOURNALED.contains(m)) {
+                    unseen.add(m);
+                }
+            }
+            if (!unseen.isEmpty() && job.regions.isEmpty() && journal.explicitSaves() == 0) {
+                extra.add(
+                    "the script also calls " + String.join(", ", unseen)
+                        + ": undo restores only blocks it set and positions saved first (undo.save, undo.region, "
+                        + "dave.te, or the request's snapshot region)");
+            }
+            snap = UndoService.record(changes, asker, job.summary, job.script, job.id, extra);
+            List<String> warnings = new ArrayList<>(changes.warnings);
+            warnings.addAll(extra);
+            for (String w : warnings) {
+                addWarning(r, "undo: " + w);
+            }
+        } else if (Config.undoEnabled) {
+            addWarning(r, "undo: no snapshot was recorded (the snapshot store is not open)");
+        }
+        if (snap != null) {
+            r.addProperty("snapshot", snap.id);
+            r.addProperty("snapshotBlocks", snap.blocks);
+            r.addProperty("snapshotEntities", snap.entities);
+            if (snap.partial) {
+                r.addProperty("snapshotPartial", true);
+            }
+        }
+        return new Ran(r, snap);
+    }
+
+    /** A confirmed run: its {@code eval_result} and the snapshot it recorded (or null). */
+    static final class Ran {
+
+        final JsonObject result;
+        final SnapshotMeta snapshot;
+
+        Ran(JsonObject result, SnapshotMeta snapshot) {
+            this.result = result;
+            this.snapshot = snapshot;
+        }
+    }
+
+    public static Map<String, Object> bindings(EntityPlayerMP player, String playerName, Object params) {
         Map<String, Object> b = new HashMap<>();
         MinecraftServer server = MinecraftServer.getServer();
         World world = player != null ? player.worldObj : DimensionManager.getWorld(0);
@@ -217,6 +481,7 @@ public final class EvalService {
         b.put("params", params == null ? new HashMap<String, Object>() : params);
         b.put("dave", new ServerEvalHelpers());
         b.put("log", DaveBridge.LOG);
+        b.put("undo", new ScriptUndo(null));
         return b;
     }
 
@@ -257,49 +522,38 @@ public final class EvalService {
      * Shows the asking player what will change, with Confirm and Cancel buttons, and parks the script. The reply to
      * the agent comes later: when the player clicks, or when the confirm expires. Server thread.
      *
-     * @return null (the reply is sent later), or an immediate error result
+     * @return {@link #PENDING} (the reply is sent later), or an immediate error result
      */
-    private static JsonObject askToConfirm(Request request, String id, ScriptEngine.Compiled compiled, Object params,
-        long timeoutMs, String playerName, String summary, long confirmSeconds, String script) throws Exception {
+    private static JsonObject askToConfirm(WriteJob job, String playerName, long confirmSeconds) {
         EntityPlayerMP player = findPlayer(playerName);
         // An asker who is not online (left, or a /dave ask test name) can still be confirmed from the console.
         String name = player != null ? player.getCommandSenderName() : playerName;
         java.util.UUID uuid = player != null ? player.getUniqueID() : TestHooks.uuidFor(playerName);
-        WriteJob job = new WriteJob(request, id, compiled, params, timeoutMs, summary);
-        PendingConfirms.Pending<WriteJob> pending = CONFIRMS.create(uuid, name, now(), confirmSeconds * 1000L, job);
+        PendingConfirms.Pending<Confirms.Job> pending = Confirms.create(player, name, uuid, confirmSeconds, job);
         if (pending == null) {
-            JsonObject r = result(id, "write");
+            JsonObject r = result(job.id, "write");
             r.addProperty("ok", false);
             r.addProperty("errorType", "too_many_pending");
             r.addProperty("error", name + " already has " + MAX_CONFIRMS_PER_PLAYER + " changes waiting for a confirm");
             return r;
         }
-        if (player != null) {
-            player.addChatMessage(confirmLine1(summary, script));
-            player.addChatMessage(confirmLine2(pending.token, confirmSeconds));
-        }
-        TIMER.schedule(
-            () -> DaveServer.QUEUE.submit("eval_confirm_expiry", EvalService::expireConfirms),
-            confirmSeconds * 1000L + 50,
-            TimeUnit.MILLISECONDS);
-
         JsonObject event = Protocol.message("eval_pending");
-        if (id != null) {
-            event.addProperty("id", id);
+        if (job.id != null) {
+            event.addProperty("id", job.id);
         }
         event.addProperty("player", name);
         event.addProperty("playerOnline", player != null);
         event.addProperty("confirmId", pending.token);
-        event.addProperty("summary", summary);
+        event.addProperty("summary", job.summary);
         event.addProperty("expiresInSeconds", confirmSeconds);
-        request.session()
+        job.request.session()
             .send(event); // no reqId: the request's reply is the eval_result after the click
         DaveBridge.LOG.info(
             "Eval {} waits for {} to confirm{}: {}",
             pending.token,
             name,
             player == null ? " (not online: use /dave confirm from the console)" : "",
-            summary);
+            job.summary);
         return PENDING;
     }
 
@@ -317,117 +571,15 @@ public final class EvalService {
         }, delay, unit);
     }
 
-    private static IChatComponent confirmLine1(String summary, String script) {
-        IChatComponent line = new ChatComponentText("[" + Config.botName + "] ");
-        line.setChatStyle(new ChatStyle().setColor(EnumChatFormatting.AQUA));
-        IChatComponent text = new ChatComponentText("wants to change the world: ");
-        text.setChatStyle(new ChatStyle().setColor(EnumChatFormatting.GOLD));
-        IChatComponent what = new ChatComponentText(summary);
-        what.setChatStyle(
-            new ChatStyle().setColor(EnumChatFormatting.WHITE)
-                .setChatHoverEvent(ChatStyles.hoverText("Script:\n" + clip(script, 800))));
-        line.appendSibling(text);
-        line.appendSibling(what);
-        return line;
-    }
-
-    private static IChatComponent confirmLine2(String token, long seconds) {
-        IChatComponent line = new ChatComponentText("");
-        line.appendSibling(
-            ChatStyles.button(
-                "Confirm",
-                EnumChatFormatting.GREEN,
-                null,
-                ChatStyles.hoverText("Run it now"),
-                ChatStyles.run("/dave confirm " + token)));
-        line.appendSibling(new ChatComponentText(" "));
-        line.appendSibling(
-            ChatStyles.button(
-                "Cancel",
-                EnumChatFormatting.RED,
-                null,
-                ChatStyles.hoverText("Do nothing"),
-                ChatStyles.run("/dave cancel " + token)));
-        IChatComponent note = new ChatComponentText(" (expires in " + formatSeconds(seconds) + ")");
-        note.setChatStyle(new ChatStyle().setColor(EnumChatFormatting.GRAY));
-        line.appendSibling(note);
-        return line;
-    }
-
-    private static String formatSeconds(long s) {
-        return s >= 120 && s % 60 == 0 ? (s / 60) + " min" : s + " s";
-    }
-
-    /**
-     * {@code /dave confirm|cancel <token>}: the Confirm and Cancel buttons, or the console. A player may answer only
-     * their own confirm; the console (any non-player sender) may answer any. Server thread (commands run there).
-     *
-     * @return the message for whoever ran it
-     */
-    public static IChatComponent onConfirmCommand(ICommandSender sender, String token, boolean confirm) {
-        EntityPlayerMP clicker = sender instanceof EntityPlayerMP ? (EntityPlayerMP) sender : null;
-        String who = sender.getCommandSenderName();
-        PendingConfirms.Resolution<WriteJob> res = CONFIRMS
-            .resolve(token, clicker == null ? null : clicker.getUniqueID(), confirm, now());
-        switch (res.outcome) {
-            case WRONG_PLAYER:
-                return DaveChat.notice("Only " + res.pending.playerName + " can confirm or cancel that.");
-            case UNKNOWN:
-                return DaveChat.notice("That change was already handled or has expired.");
-            case CANCELLED: {
-                WriteJob job = res.pending.payload;
-                JsonObject r = result(job.id, "write");
-                r.addProperty("ok", false);
-                r.addProperty("errorType", "cancelled");
-                r.addProperty("error", who + " clicked Cancel; nothing was run");
-                job.request.reply(r);
-                DaveBridge.LOG.info("{} cancelled eval {}: {}", who, res.pending.token, job.summary);
-                return DaveChat.notice("Cancelled. Nothing was changed.");
-            }
-            case CONFIRMED:
-            default: {
-                WriteJob job = res.pending.payload;
-                String asker = res.pending.playerName;
-                runBackupCommand();
-                DaveBridge.LOG.info("{} confirmed eval {} for {}: {}", who, res.pending.token, asker, job.summary);
-                DaveServer.QUEUE.submit("eval_confirmed", () -> {
-                    JsonObject r = runNow(job.id, "write", job.compiled, job.params, job.timeoutMs, asker, true);
-                    r.addProperty("confirmedBy", who);
-                    job.request.reply(r);
-                    boolean ok = r.has("ok") && r.get("ok")
-                        .getAsBoolean();
-                    String outcome = ok ? "Done."
-                        : "That change failed: " + clip(
-                            r.get("error")
-                                .getAsString(),
-                            200);
-                    EntityPlayerMP askerPlayer = findPlayer(asker);
-                    if (askerPlayer != null) {
-                        askerPlayer.addChatMessage(DaveChat.notice(outcome));
-                    }
-                    if (clicker == null) {
-                        sender.addChatMessage(DaveChat.notice("Eval " + res.pending.token + ": " + outcome));
-                    }
-                });
-                return DaveChat.notice("Confirmed. Running it now...");
-            }
-        }
+    /** {@code /dave confirm|cancel <token>}. See {@link Confirms#onCommand}. */
+    public static IChatComponent onConfirmCommand(net.minecraft.command.ICommandSender sender, String token,
+        boolean confirm) {
+        return Confirms.onCommand(sender, token, confirm);
     }
 
     /** {@code /dave pending}: every change waiting for a confirm, one line each. */
     public static List<String> describePending() {
-        List<String> out = new java.util.ArrayList<>();
-        long now = now();
-        for (PendingConfirms.Pending<WriteJob> p : CONFIRMS.list()) {
-            out.add(
-                p.token + "  "
-                    + p.playerName
-                    + "  "
-                    + Math.max(0, (p.expiresAt - now) / 1000)
-                    + " s left  "
-                    + p.payload.summary);
-        }
-        return out;
+        return Confirms.describe();
     }
 
     /** Runs {@code backupCommand} as the server, if configured. Best effort; a failure is logged, not fatal. */
@@ -446,28 +598,10 @@ public final class EvalService {
         }
     }
 
-    /** Server thread: answers and tells the player about every confirm past its time. */
-    static void expireConfirms() {
-        List<PendingConfirms.Pending<WriteJob>> expired = CONFIRMS.expire(now());
-        for (PendingConfirms.Pending<WriteJob> p : expired) {
-            JsonObject r = result(p.payload.id, "write");
-            r.addProperty("ok", false);
-            r.addProperty("errorType", "expired");
-            r.addProperty("error", p.playerName + " did not confirm in time; nothing was run");
-            p.payload.request.reply(r);
-            EntityPlayerMP player = findPlayer(p.playerName);
-            if (player != null) {
-                player.addChatMessage(DaveChat.notice("Dave's change expired without a confirm; nothing was changed."));
-            }
-        }
-    }
-
     /** Server stopping: answers every waiting confirm. */
     public static void serverStopping() {
         ClientEvalRelay.serverStopping();
-        for (PendingConfirms.Pending<WriteJob> p : CONFIRMS.clear()) {
-            p.payload.request.error(Protocol.ERR_CANCELLED, "server stopping before the confirm");
-        }
+        Confirms.serverStopping();
     }
 
     // ------------------------------------------------------------------ describe
@@ -545,7 +679,7 @@ public final class EvalService {
     }
 
     /** An online player by name, case-insensitive, or null. Server thread. */
-    static EntityPlayerMP findPlayer(String name) {
+    public static EntityPlayerMP findPlayer(String name) {
         if (name == null) {
             return null;
         }
@@ -562,7 +696,7 @@ public final class EvalService {
      * Like {@link MessageRouter#runOnMainThread}, but a task may return {@link #PENDING} to answer later itself.
      * Failures become {@code error} replies with the request's reqId.
      */
-    static void onMain(Request request, String label, java.util.concurrent.Callable<JsonObject> work) {
+    public static void onMain(Request request, String label, java.util.concurrent.Callable<JsonObject> work) {
         DaveServer.QUEUE.submit(label, work)
             .whenComplete((result, failure) -> {
                 try {
@@ -596,7 +730,7 @@ public final class EvalService {
             });
     }
 
-    static long optLong(JsonObject body, String key, long def) throws ProtocolException {
+    public static long optLong(JsonObject body, String key, long def) throws ProtocolException {
         JsonElement el = body.get(key);
         if (el == null || el.isJsonNull()) {
             return def;
@@ -617,16 +751,16 @@ public final class EvalService {
     }
 
     /** JSON params as plain Java maps, lists, strings, doubles and booleans. */
-    static Object toJava(JsonElement el) {
+    public static Object toJava(JsonElement el) {
         return el == null || el.isJsonNull() ? null : GSON.fromJson(el, Object.class);
     }
 
-    static String clip(String s, int max) {
+    public static String clip(String s, int max) {
         return s == null || s.length() <= max ? s : s.substring(0, max) + "...";
     }
 
     /** For status: how many confirms are waiting. */
     public static int pendingConfirms() {
-        return CONFIRMS.size();
+        return Confirms.size();
     }
 }

@@ -15,6 +15,7 @@ import org.codehaus.groovy.control.CompilationFailedException;
 import org.codehaus.groovy.control.CompilerConfiguration;
 import org.codehaus.groovy.control.customizers.ImportCustomizer;
 import org.codehaus.groovy.runtime.InvokerHelper;
+import org.codehaus.groovy.runtime.typehandling.DefaultTypeTransformation;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -157,19 +158,71 @@ public final class ScriptEngine {
         return compiled;
     }
 
+    /** What one run of a script did: its raw value or failure, what it printed, and how long it took. */
+    public static final class Outcome {
+
+        /** The script's last expression, or null when it failed. */
+        public final Object value;
+        /** What the script threw (a {@link ScriptTimeout} when it ran out of time), or null. */
+        public final Throwable failure;
+        public final String output;
+        public final boolean outputTruncated;
+        public final double ms;
+        final String scriptClass;
+
+        Outcome(Object value, Throwable failure, String output, boolean outputTruncated, double ms,
+            String scriptClass) {
+            this.value = value;
+            this.failure = failure;
+            this.output = output;
+            this.outputTruncated = outputTruncated;
+            this.ms = ms;
+            this.scriptClass = scriptClass;
+        }
+
+        public boolean ok() {
+            return failure == null;
+        }
+
+        /** {@code timeout} or {@code exception}; null when the script succeeded. */
+        public String errorType() {
+            return failure == null ? null : unwrap(failure) instanceof ScriptTimeout ? "timeout" : "exception";
+        }
+
+        /** The failure as one line (Groovy's shaded class names shown unshaded), or null. */
+        public String error() {
+            return failure == null ? null : clip(unshade(unwrap(failure).toString()), 2000);
+        }
+
+        /** Adds {@code ok:false}, {@code errorType}, {@code error}, {@code line} and {@code stack} to a reply. */
+        public void describeFailure(JsonObject into) {
+            if (failure != null) {
+                ScriptEngine.describeFailure(into, failure, scriptClass);
+            }
+        }
+
+        /** Groovy truth of the value: null, false, 0 and empty strings, maps and collections are false. */
+        public boolean truthy() {
+            if (failure != null) {
+                return false;
+            }
+            try {
+                return DefaultTypeTransformation.castToBoolean(value);
+            } catch (Throwable t) {
+                return value != null;
+            }
+        }
+    }
+
     /**
-     * Runs a compiled script on the calling thread (the game's main thread) and describes the outcome as JSON:
-     * {@code ok}, {@code result}, {@code output}, {@code ms}, and on failure {@code error}, {@code errorType},
-     * {@code line}, {@code stack}. Never throws.
+     * Runs a compiled script on the calling thread (the game's main thread) and returns its raw outcome, with the
+     * same time limit and exception capture as {@link #run}. Never throws.
      *
      * @param bindings  variables the script sees ({@code out} is added: what it prints)
      * @param timeoutMs the script's time limit
-     * @param limits    size limits for the result
      * @param maxOutput characters of printed output kept
      */
-    public JsonObject run(Compiled compiled, Map<String, Object> bindings, long timeoutMs, JsonDump.Limits limits,
-        int maxOutput) {
-        JsonObject reply = new JsonObject();
+    public Outcome evaluate(Compiled compiled, Map<String, Object> bindings, long timeoutMs, int maxOutput) {
         CappedWriter output = new CappedWriter(maxOutput);
         PrintWriter out = new PrintWriter(output, true);
         Binding binding = new Binding();
@@ -190,32 +243,51 @@ public final class ScriptEngine {
             Deadline.end();
         }
         double ms = (System.nanoTime() - start) / 1_000_000.0;
-        reply.addProperty("ms", Math.round(ms * 100) / 100.0);
-        if (failure != null) {
-            describeFailure(reply, failure, compiled.type.getName());
+        out.flush();
+        return new Outcome(value, failure, output.toString(), output.truncated(), ms, compiled.type.getName());
+    }
+
+    /** A script value as capped JSON, under a time limit of its own (toString of a huge object can be slow). */
+    public static JsonElement toJson(Object value, JsonDump dump, long timeoutMs) {
+        Deadline.begin(Math.max(timeoutMs, 1000));
+        try {
+            return dump.toJson(value);
+        } catch (Throwable t) {
+            return new JsonPrimitive("<result could not be converted: " + t + ">");
+        } finally {
+            Deadline.end();
+        }
+    }
+
+    /**
+     * Runs a compiled script on the calling thread (the game's main thread) and describes the outcome as JSON:
+     * {@code ok}, {@code result}, {@code output}, {@code ms}, and on failure {@code error}, {@code errorType},
+     * {@code line}, {@code stack}. Never throws.
+     *
+     * @param bindings  variables the script sees ({@code out} is added: what it prints)
+     * @param timeoutMs the script's time limit
+     * @param limits    size limits for the result
+     * @param maxOutput characters of printed output kept
+     */
+    public JsonObject run(Compiled compiled, Map<String, Object> bindings, long timeoutMs, JsonDump.Limits limits,
+        int maxOutput) {
+        Outcome outcome = evaluate(compiled, bindings, timeoutMs, maxOutput);
+        JsonObject reply = new JsonObject();
+        reply.addProperty("ms", Math.round(outcome.ms * 100) / 100.0);
+        if (outcome.failure != null) {
+            outcome.describeFailure(reply);
         } else {
             JsonDump dump = new JsonDump(limits);
-            JsonElement json;
-            Deadline.begin(Math.max(timeoutMs, 1000));
-            try {
-                json = dump.toJson(value);
-            } catch (Throwable t) {
-                json = new JsonPrimitive("<result could not be converted: " + t + ">");
-            } finally {
-                Deadline.end();
-            }
             reply.addProperty("ok", true);
-            reply.add("result", json);
+            reply.add("result", toJson(outcome.value, dump, timeoutMs));
             if (dump.truncated()) {
                 reply.addProperty("truncated", true);
             }
         }
-        out.flush();
-        String printed = output.toString();
-        if (!printed.isEmpty()) {
-            reply.addProperty("output", printed);
+        if (!outcome.output.isEmpty()) {
+            reply.addProperty("output", outcome.output);
         }
-        if (output.truncated()) {
+        if (outcome.outputTruncated) {
             reply.addProperty("outputTruncated", true);
         }
         return reply;

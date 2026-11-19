@@ -32,6 +32,10 @@ max_per_player = 2                         # questions one player may have waiti
 max_queue = 10                             # questions waiting in total before new ones are turned away
 stale_seconds = 300                        # a question that waited this long while the bridge was down is dropped,
                                            # with a notice. Time spent behind Dave's earlier turns does not count.
+# Hook notifications (DaveBridge hook_fired) become kind="event" turns (dave/ENVELOPE.md 1a). Questions go first.
+event_max_queued = 3                       # event turns waiting at once; a firing beyond this is dropped (and counted)
+event_turns_per_hour = 30                  # event turns run per hour, all hooks together
+event_stale_seconds = 1800                 # an event turn that waited this long while Dave was free is dropped
 
 [paths]
 gtnh_src    = "gtnh-src"                   # DAVE_GTNH_SRC     read-only source tree

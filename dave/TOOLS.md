@@ -147,7 +147,7 @@ eval and lessons, so a confirm always goes to the person who asked. Claude may n
 
 | Tool | Does |
 |---|---|
-| `eval(script, mode="read", summary?, params?, timeout_ms?, side="server", player?)` | Groovy in the live JVM on the server thread (time limit, capped JSON result, blocked footguns, MCP names at runtime). `mode="write"` needs `summary`; the call waits (up to 2 min) for the asker's in-game Confirm. `side="client"` runs on the asker's own client, only if they opted in |
+| `eval(script, mode="read", summary?, params?, timeout_ms?, side="server", player?, snapshot?)` | Groovy in the live JVM on the server thread (time limit, capped JSON result, blocked footguns, MCP names at runtime). `mode="write"` needs `summary`; the call waits (up to 2 min) for the asker's in-game Confirm, and the confirmed run is recorded as an undo snapshot (`snapshot`: extra regions to save first). `side="client"` runs on the asker's own client, only if they opted in |
 | `describe(target="looking", x?, y?, z?, dim?, entity_id?, player?)` | Block, tile entity, item or entity at runtime: id, meta, class, name, GT MetaTileEntity, recipe map, description, inventory |
 | `query_run(name, params?, summary?, timeout_ms?)` | A saved query (below) |
 | `query_list()` / `query_get(name)` | What saved queries exist / one in full |
@@ -156,6 +156,10 @@ eval and lessons, so a confirm always goes to the person who asked. Claude may n
 | `list_players()` | Who is online |
 | `lesson(lesson, player?)` | Show one player a guided demonstration ("show me"); see below |
 | `lesson_stop(player?, id?)` | Stop that player's demonstration |
+| `hook_add(event, name?, note?, notify?, script?, params?, filter?, every_ticks?, once?, cooldown_seconds?, edge?, fire_if_true_at_start?, expires_in_seconds?, owner?)` | Watch the game for a player; when it fires Dave gets a `kind="event"` turn. See below |
+| `hook_list(owner?)` / `hook_remove(id? \| owner?)` | The hooks on the server; remove one, or all of a player's |
+| `snapshot_list(player?, limit?)` / `snapshot_get(snapshot="last", of?)` | Undo snapshots of confirmed writes; one with a preview (first changes, positions changed since) |
+| `undo(snapshot="last", of?, force?)` | Roll a confirmed write back; the asker confirms it in chat first. See below |
 
 **Saved queries.** Groovy files with a `// @key: value` header (`dave/bridge/queries.py`). Two folders: the
 shipped starters in `dave/queries/` (read-only, in the image) and Dave's saved ones in `[paths] queries`
@@ -200,6 +204,32 @@ reported the `lesson` capability) and `Daemon.lesson_status` (uuid -> how their 
 - Allow rule: `mcp__bridge__lesson`, `mcp__bridge__lesson_stop` (covered by `mcp__bridge`).
 - Not done yet (optional context): put "can see demonstrations" (`lesson_capable`) in the envelope, and the latest
   `lesson_status` (e.g. "stopped: walked_away") so Dave knows whether the player watched it.
+
+### Hooks and undo (DaveBridge 0.3.0)
+
+DaveBridge 0.3.0 handles `hook_add`, `hook_list`, `hook_remove`, `snapshot_list`, `snapshot_get` and `undo` and lists
+them in `hello.accepts` (spec: `DaveBridge/PROTOCOL.md` 1.9 and 1.10; design notes: `docs/plans/hooks-and-undo.md`
+in the private project). Against an older DaveBridge the tools answer that they need 0.3.0. They are covered by the
+`mcp__bridge` allow rule; nothing else changes in the launch config.
+
+- **`hook_add`.** The owner defaults to the asker. `event` is `player_join`, `player_leave`, `player_death`,
+  `player_dimension`, `entity_death`, `block_break`, `block_place`, `chat`, `quest_complete` or `poll`. The tool's
+  snake_case arguments become the hook object's fields (`every_ticks` -> `everyTicks`, and so on; `filter` and
+  `params` pass through). A `poll` hook needs `script`, a read-only Groovy condition run every `every_ticks` ticks
+  that fires when it turns true; other events take an optional `script` filter. DaveBridge refuses scripts that
+  change the world, runs a poll condition once when it is added (an error comes back at once), and disables a hook
+  whose script keeps failing (Dave then gets an event turn with `status="disabled"`). Hooks are saved in the world
+  folder and survive restarts.
+- **Event turns.** `hook_fired` and `hook_disabled` become `kind="event"` turns (`ENVELOPE.md` 1a) for the hook's
+  owner, after any waiting player question, capped and coalesced by the daemon (`[session] event_*` in
+  `config.toml`).
+- **`eval` writes are undoable.** A confirmed write records what it changed and names the snapshot in its result
+  (`snapshot`, `snapshotBlocks`). Its new `snapshot` argument saves regions first; inside the script, `undo.save` /
+  `undo.region` and `dave.te` do the same for single positions.
+- **`undo`.** The player defaults to the asker, who must confirm it in chat (the call waits for the click, then for
+  the restore). `snapshot="last"` is the asker's newest change (`of` another player, `"*"` anyone's). It skips
+  positions changed since unless `force`, and returns `restored`, `conflicts`, `warnings` and `redo` (undoing that
+  snapshot re-applies the change). Players can also click `[Undo]` after a confirmed change or type `/dave undo <id>`.
 
 ## Adding a tool (checklist)
 

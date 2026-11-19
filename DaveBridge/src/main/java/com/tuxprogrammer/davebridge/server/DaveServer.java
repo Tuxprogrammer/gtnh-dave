@@ -10,8 +10,10 @@ import com.tuxprogrammer.davebridge.server.bridge.BridgeService;
 import com.tuxprogrammer.davebridge.server.chat.ChatHandlers;
 import com.tuxprogrammer.davebridge.server.command.CommandDave;
 import com.tuxprogrammer.davebridge.server.eval.EvalService;
+import com.tuxprogrammer.davebridge.server.hooks.HookService;
 import com.tuxprogrammer.davebridge.server.lesson.LessonService;
 import com.tuxprogrammer.davebridge.server.network.ServerPacketHandlers;
+import com.tuxprogrammer.davebridge.server.undo.UndoService;
 
 import cpw.mods.fml.common.FMLCommonHandler;
 import cpw.mods.fml.common.event.FMLServerStartingEvent;
@@ -40,6 +42,8 @@ public final class DaveServer {
         EvalService.register(BRIDGE.router());
         ServerPacketHandlers.register();
         LessonService.register(BRIDGE.router());
+        HookService.register(BRIDGE.router());
+        UndoService.register(BRIDGE.router());
 
         ServerEventHandler handler = new ServerEventHandler();
         MinecraftForge.EVENT_BUS.register(handler); // ServerChatEvent
@@ -68,6 +72,9 @@ public final class DaveServer {
     }
 
     public static void serverStarted() {
+        // Before the socket opens, so notifications waiting from the last run go to the first agent.
+        UndoService.serverStarted();
+        HookService.serverStarted();
         MinecraftServer server = MinecraftServer.getServer();
         if (server != null && !server.isDedicatedServer() && !Config.startOnIntegratedServer) {
             DaveBridge.LOG.info("Integrated server: not opening the agent socket (network.startOnIntegratedServer)");
@@ -78,6 +85,16 @@ public final class DaveServer {
 
     public static void serverStopping() {
         EvalService.serverStopping();
+        try {
+            UndoService.serverStopping();
+        } catch (Throwable t) {
+            DaveBridge.LOG.warn("Undo shutdown failed", t);
+        }
+        try {
+            HookService.serverStopping();
+        } catch (Throwable t) {
+            DaveBridge.LOG.warn("Hooks shutdown failed", t);
+        }
         shutdownBridge();
         CLIENTS.clear();
     }
@@ -92,6 +109,20 @@ public final class DaveServer {
         QUEUE.clear("server stopping");
         BRIDGE.stop();
         QUEUE.clear("server stopping");
+    }
+
+    /** Once per server tick (END phase), after the queue: hook polls and the running undo. Never throws. */
+    public static void tick(long serverTick) {
+        try {
+            HookService.tick(serverTick);
+        } catch (Throwable t) {
+            DaveBridge.LOG.warn("Hook tick failed", t);
+        }
+        try {
+            UndoService.tick();
+        } catch (Throwable t) {
+            DaveBridge.LOG.warn("Undo tick failed", t);
+        }
     }
 
     /**

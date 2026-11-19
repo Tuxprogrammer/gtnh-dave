@@ -106,5 +106,7 @@ public class ServerEventHandler {
         } catch (Throwable t) {
             DaveBridge.LOG.warn("Main-thread queue drain failed", t);
         }
+        MinecraftServer server = MinecraftServer.getServer();
+        DaveServer.tick(server != null ? server.getTickCounter() : 0);
     }
 }

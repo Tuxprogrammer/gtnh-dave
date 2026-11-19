@@ -12,7 +12,8 @@ Reads one user message per stdin line and answers by keyword in the envelope's <
   WHISPER  "@whisper\\n..."     NONE  "@none"     NODIR  an answer with no directive line
   ERROR    a result with is_error
 otherwise "@reply\\nhello <player>" plus flags: "warn" if the envelope had <warnings>, "recent" if <recent>.
-A kind="retry" envelope (after a crash) is answered "hello <player> (retry)".
+A kind="retry" envelope (after a crash) is answered "hello <player> (retry)"; a kind="event" envelope (a hook
+notification) "@whisper\\nhook <id> fired, <owner>" (after 1 s when it contains PAUSE).
 Every received envelope is appended to <cwd>/../fake/envelopes.jsonl, every start to starts.jsonl, and (like
 the real CLI) to the session transcript $CLAUDE_CONFIG_DIR/projects/fake/<session>.jsonl.
 """
@@ -56,6 +57,12 @@ for line in sys.stdin:
     name = re.search(r'<player name="([^"]*)"', content).group(1)
     if 'kind="retry"' in content:
         result("@reply\nhello " + name + " (retry)")
+        continue
+    if 'kind="event"' in content:                 # a hook notification: no <message>
+        hook = re.search(r'<event hook="([^"]*)"', content).group(1)
+        if "PAUSE" in content:
+            time.sleep(1)
+        result("@whisper\nhook " + hook + " fired, " + name)
         continue
     msg = re.search(r"<message>(.*)</message>", content, re.S).group(1)
     crashed = os.path.join(state, "crashed")
