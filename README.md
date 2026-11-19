@@ -79,7 +79,7 @@ Dave was built for a private server whose whitelist holds only trusted players. 
 - [x] Daemon: one long-lived Claude session with memory, cooldowns and queue caps, session rotation, crash resume.
 - [x] Recipe knowledge: recipe export from your own pack, the `recipes` MCP server with an LP chain planner, semantic search over quests, wiki and GuideNH.
 - [x] Guided demonstrations: a client-side ghost Dave walks the player through a task in their own world.
-- [ ] Event-hook subscriptions; a real snapshot/undo for world changes.
+- [x] Event-hook subscriptions (game events and polled conditions, kept across restarts) and a real snapshot/undo for world changes (blocks and tile entities each confirmed write touched; see `DaveBridge/PROTOCOL.md` sections 1.9 and 1.10).
 
 ## License
 
