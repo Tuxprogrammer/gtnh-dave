@@ -23,6 +23,14 @@
       "ours": true
     },
     {
+      "jar": "merrygregmas-(?P<version>.+)\\.jar",
+      "kind": "git",
+      "repo": "https://github.com/Tuxprogrammer/MerryGregmas",
+      "tag": "{version}",
+      "name": "Merry Gregmas",
+      "ours": true
+    },
+    {
       "jar": "lostcitiesnh-(?P<version>.+)\\.jar",
       "kind": "git",
       "repo": "https://github.com/Tuxprogrammer/LostCities",

@@ -21,7 +21,8 @@ only reads class files. Run Python with -I.
 usage: DAVE_AGENT_ROOT=<project root> python3 -I tools/decomp/tuxmine_extras.py [--plan] [--no-stamp]
   --plan      resolve and print what would be done, change nothing (still needs the network for ls-remote)
   --no-stamp  do not record the gtnh-src stamp (for partial runs)
-Environment: DAVE_AGENT_ROOT, VINEFLOWER_JAR (default: newest <root>/.work/gtnh-*/tools/vineflower-*.jar), plus the
+Environment: DAVE_AGENT_ROOT, VINEFLOWER_JAR (default: newest <root>/.work/gtnh-*/tools/vineflower-*.jar),
+TUXMINE_EXTRAS_GIT_CREDENTIAL_HELPER (a git credential.helper for private repos, e.g. "!gh auth git-credential"), plus the
 packstate.py variables.
 """
 import fnmatch, hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, time, zipfile
@@ -64,7 +65,13 @@ def log(*a):
 
 def git(*args, cwd=None, check=True, capture=True, stdout=None):
     # core.symlinks=false: a symlink in an untrusted repo is checked out as a plain text file.
-    cmd = ["git", "-c", "core.symlinks=false", "-c", "protocol.file.allow=user"] + list(args)
+    cmd = ["git", "-c", "core.symlinks=false", "-c", "protocol.file.allow=user"]
+    # Private repos (an owner's unreleased mod): the only credential source is an opt-in helper, e.g.
+    # TUXMINE_EXTRAS_GIT_CREDENTIAL_HELPER='!gh auth git-credential'. The global and system git config stay off.
+    helper = os.environ.get("TUXMINE_EXTRAS_GIT_CREDENTIAL_HELPER")
+    if helper:
+        cmd += ["-c", "credential.helper=" + helper]
+    cmd += list(args)
     p = subprocess.run(cmd, cwd=cwd, env=GIT_ENV, stdout=stdout or (subprocess.PIPE if capture else None),
                        stderr=subprocess.PIPE, timeout=1800)
     if check and p.returncode != 0:

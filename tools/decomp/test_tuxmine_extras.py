@@ -19,6 +19,7 @@ import tuxmine_extras as tx  # noqa: E402
 # The jars the packs shipped when the mapping was written: each must match exactly one entry.
 KNOWN_JARS = {
     "gregguns-0.4.0-beta.jar": "0.4.0-beta",
+    "merrygregmas-0.2.1-beta.jar": "0.2.1-beta",
     "lostcitiesnh-0.4.1-beta.jar": "0.4.1-beta",
     "fortunateone-v1.1.11.jar": "v1.1.11",
     "ezstorage-1.8.2.jar": "1.8.2",
