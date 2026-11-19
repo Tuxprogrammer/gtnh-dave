@@ -1,0 +1,21 @@
+# Secrets and per-machine state never go in git.
+.env
+dave/.env
+dave/.claude-home/
+dave/.run/
+__pycache__/
+*.pyc
+.claude/worktrees/
+.claude/settings.local.json
+.playwright-mcp/
+
+# Everything Dave builds from YOUR pack, and everything he remembers, is local: the search corpus and embeddings,
+# the recipe database, the decompiled/upstream source tree, pack stamps, and memories (they hold player data).
+# Only the blank-memory README is tracked. When this repo is used as a submodule of a private project (see
+# README.md, "Project root"), these live in that project instead.
+data/*
+!data/memory/
+data/memory/*
+!data/memory/README.md
+gtnh-src/
+.work/

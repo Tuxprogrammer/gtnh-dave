@@ -1,0 +1,4 @@
+# tools/recipes: the chain planner's LP solver. Everything else in tools/recipes is standard library.
+# numpy: the planner builds its LP arrays with it (also highspy's own dependency); pinned so the image is reproducible.
+highspy==1.15.1
+numpy==2.5.4
