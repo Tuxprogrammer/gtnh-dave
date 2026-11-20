@@ -32,6 +32,7 @@ KNOWN_JARS = {
     "worldedit-v0.0.9.jar": "v0.0.9",
     "worldedit-1.0.1.jar": "1.0.1",
     "gtnhplanner-0.2.0-beta.3.jar": "0.2.0-beta.3",
+    "gtnhplanner-0.2.0-beta.3-tux.1.jar": "0.2.0-beta.3-tux.1",
     "davebridge-0.2.6.jar": "0.2.6",
     "DiscordIntegrationUnoffical-mc1.7.10-3.1.1_3.8.3_464.jar": "3.1.1_3.8.3_464",
     "journeymap-1.7.10-5.2.23-unlimited.jar": "5.2.23",

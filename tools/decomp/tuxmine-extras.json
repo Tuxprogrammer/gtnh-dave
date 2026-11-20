@@ -107,10 +107,10 @@
     {
       "jar": "gtnhplanner-(?P<version>.+)\\.jar",
       "kind": "git",
-      "repo": "https://github.com/jackwrichards/gtnh-planner-mod",
-      "tag": "{version}",
+      "repo": "https://github.com/Tuxprogrammer/gtnh-factory-flow",
+      "tag": "mod-{version}",
       "name": "GTNH Planner",
-      "notes": "Client-only NEI flowchart planner (com.gtnhplanner), built on PlanNH; in the client pack only. The jar shades the ojAlgo LP library unrelocated (org.ojalgo).",
+      "notes": "NEI flowchart planner (com.gtnhplanner), built on PlanNH. Its source is in jvm/mod (the mod) and jvm/core (the shared core modules it shades) of the planner website's repository, tagged mod-<version>; the 0.2.0-beta.3 jar came from jackwrichards/gtnh-planner-mod. Client-side; on a dedicated server it only loads and writes its config. The jar shades the ojAlgo LP library unrelocated (org.ojalgo).",
       "bundles": [
         {
           "name": "ojAlgo",
