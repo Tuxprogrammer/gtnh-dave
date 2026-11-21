@@ -143,7 +143,8 @@ class Endpoints(Base):
                            ("plans-diff", "plan_diff"), ("plans-expand-inputs", "plan_expand_inputs")):
             ex = EXAMPLES[name]
             self.site.routes[ex["endpoint"]] = (ex["status"], ex["response"])
-            text, err = self.call(tool, **ex["request"])
+            extra = {"allowSteam": True} if tool in server.STEAM_TOOLS else {}
+            text, err = self.call(tool, **ex["request"], **extra)
             self.assertFalse(err, text)
             self.assertEqual(json.loads(text), ex["response"])
             self.assertEqual(text, server.compact(ex["response"]))   # compact, unindented
@@ -193,6 +194,32 @@ class Endpoints(Base):
         text, _ = self.call("plan_deliver", **ex["request"])
         self.assertEqual(json.loads(text), short)
 
+    def test_steam_machines_banned_unless_allowed(self):
+        self.site.routes["plans/create"] = (200, {"planId": "xa"})
+        self.site.routes["plans/expand-inputs"] = (200, {"inputs": []})
+        self.site.routes["recipes/search"] = (200, {"results": []})
+        self.call("plan_create", name="n", constraints={"tierCap": "EV", "banned": ["Steam-Grinder"]})
+        sent = self.site.requests[-1]["body"]["constraints"]
+        self.assertEqual(sent["tierCap"], "EV")
+        self.assertEqual(sent["banned"][0], "Steam-Grinder")
+        self.assertEqual(len(sent["banned"]), len(server.STEAM_MACHINES))   # no duplicate, case-insensitive
+        self.assertNotIn("allowSteam", self.site.requests[-1]["body"])
+        self.call("recipes_search", text="dust")                            # no tierCap: still banned
+        self.assertEqual(self.site.requests[-1]["body"]["constraints"]["banned"], list(server.STEAM_MACHINES))
+        self.call("recipes_search", text="dust", allowSteam=True)
+        self.assertNotIn("constraints", self.site.requests[-1]["body"])
+        self.call("plan_create", name="n", constraints={"tierCap": "ULV"})  # steam age: allowed by default
+        self.assertNotIn("banned", self.site.requests[-1]["body"]["constraints"])
+
+    def test_expand_follows_the_drafts_steam_choice(self):
+        self.site.routes["plans/create"] = (200, {"planId": "xsteam"})
+        self.site.routes["plans/expand-inputs"] = (200, {"inputs": []})
+        self.call("plan_create", name="n", constraints={"tierCap": "ULV"})
+        self.call("plan_expand_inputs", planId="xsteam")
+        self.assertNotIn("constraints", self.site.requests[-1]["body"])
+        self.call("plan_expand_inputs", planId="xother")                    # unknown draft (e.g. imported): banned
+        self.assertEqual(self.site.requests[-1]["body"]["constraints"]["banned"], list(server.STEAM_MACHINES))
+
     def test_every_tool_maps_to_its_endpoint(self):
         args = {"resources_search": {"text": "x"}, "recipes_search": {"text": "x"}, "recipes_get": {"recipeId": "r"},
                 "plan_create": {"name": "n"}, "plan_import": {"snapshot": {}},
@@ -209,7 +236,8 @@ class Endpoints(Base):
         for tool, a in args.items():
             endpoint = server.ENDPOINTS[tool][0]
             self.site.routes[endpoint] = (200, {"ok": tool})
-            text, err = self.call(tool, **a)
+            extra = {"allowSteam": True} if tool in server.STEAM_TOOLS else {}   # steam rule: own test
+            text, err = self.call(tool, **a, **extra)
             self.assertFalse(err, text)
             self.assertEqual(json.loads(text), {"ok": tool})
             self.assertEqual(self.site.requests[-1]["endpoint"], endpoint)
@@ -217,7 +245,7 @@ class Endpoints(Base):
 
     def test_player_is_passed_through_and_nulls_dropped(self):
         self.site.routes["plans/create"] = (200, {"planId": "p1"})
-        text, err = self.call("plan_create", name="Titanium", constraints=None,
+        text, err = self.call("plan_create", name="Titanium", constraints=None, allowSteam=True,
                               player={"name": "Steve", "uuid": "00000000-0000-0000-0000-000000000001"})
         self.assertEqual(json.loads(text), {"planId": "p1"})
         self.assertEqual(self.site.requests[-1]["body"], {

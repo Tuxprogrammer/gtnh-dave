@@ -69,6 +69,40 @@ CONSTRAINTS = {
                    "free": {"type": "array", "items": {"type": "string"}}},
 }
 LIMIT = {"type": "integer", "minimum": 1, "maximum": 25, "default": 8}
+
+# Steam machines read as 0 EU to the site, so its rank and its default machine choice treat them as free, and their
+# dataset tiers (taken from the recipe's EU) don't let tierCap filter them. Until the site handles steam itself, these
+# tools ban every steam machine unless the plan is for a steam-age player. Handler ids from the planner dataset.
+STEAM_MACHINES = (
+    "steam-alloy-smelter", "steam-ammo-press", "steam-blender", "steam-compressor", "steam-extractor",
+    "steam-forge-hammer", "steam-furnace", "steam-fuser", "steam-grinder", "steam-hearth", "steam-macerator",
+    "steam-presser", "steam-purifier", "steam-separator", "steam-squasher",
+    "high-pressure-steam-alloy-smelter", "high-pressure-steam-compressor", "high-pressure-steam-extractor",
+    "high-pressure-steam-forge-hammer", "high-pressure-steam-furnace", "high-pressure-steam-macerator",
+)
+ALLOW_STEAM = {"type": "boolean", "description": (
+    "Allow steam machines (default: only when tierCap is ULV). Steam isn't free, so leave this off for any player "
+    "past the steam age; these tools then ban every steam machine.")}
+STEAM_TOOLS = ("plan_create", "recipes_search", "plan_expand_inputs")
+
+
+def apply_steam_rule(body, default=None):
+    """Strip the tools-only allowSteam flag; unless steam is allowed, add every steam machine to constraints.banned.
+
+    Returns (body, allowed). `default` is the draft's own choice (from plan_create), used when the call gives none.
+    """
+    allow = body.pop("allowSteam", None)
+    constraints = dict(body.get("constraints") or {})
+    if allow is None:
+        allow = default if default is not None else constraints.get("tierCap") == "ULV"
+    if allow:
+        return body, True
+    banned = list(constraints.get("banned") or [])
+    seen = {str(b).lower() for b in banned}
+    banned += [m for m in STEAM_MACHINES if m not in seen]
+    constraints["banned"] = banned
+    body["constraints"] = constraints
+    return body, False
 CARD = {
     "type": "object", "additionalProperties": False, "required": ["recipeId"],
     "properties": {
@@ -114,7 +148,7 @@ ENDPOINTS = {
                 "text": {"type": "string", "minLength": 1, "maxLength": 100},
                 "machine": {"type": "string", "description": "Recipe map or machine name or id, e.g. "
                                                              "'Electrolyzer'."},
-                "constraints": CONSTRAINTS, "limit": LIMIT,
+                "constraints": CONSTRAINTS, "allowSteam": ALLOW_STEAM, "limit": LIMIT,
                 "offset": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 0},
                 "detail": {"type": "boolean"}})),
     "recipes_get": ("recipes/get", (
@@ -124,7 +158,8 @@ ENDPOINTS = {
     "plan_create": ("plans/create", (
         "Start an empty draft plan on the planner site; returns {planId, name, expiresAt, constraints}. The draft "
         "expires 24 h after its last change and a site restart drops it. Set the constraints here: plan_solve "
-        "takes none."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS},
+        "takes none."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS,
+                                                        "allowSteam": ALLOW_STEAM},
                                                         ["name"])),
     "plan_import": ("plans/import", (
         "Start a draft from a slim plan snapshot (version 1: plan, cards, drawers, wires, targets; see the agent "
@@ -177,11 +212,11 @@ ENDPOINTS = {
         "each actually tried in a copy of the draft and solved, with machines, euPerItem, newRaws, "
         "usesByproducts, works and a plain reason. Inputs marked raw: true may stay unsupplied; accepted lists "
         "the free ones. Up to 6 inputs per call: more: true and remaining mean page on with resources. The rank "
-        "ignores leftover byproducts (named in reason), calls some never-spawning ore materials raw, shows steam "
-        "machines at 0 EU and sees only the first 12 recipes per input: judge it, don't just take the top one. "
+        "ignores leftover byproducts (named in reason), calls some never-spawning ore materials raw "
+        "and sees only the first 12 recipes per input: judge it, don't just take the top one. "
         "Add your choice with plan_add_cards and its recipeId. constraints apply to this call only."),
         schema(dict(PLAN, resources={"type": "array", "items": RESOURCE, "maxItems": 16}, constraints=CONSTRAINTS,
-                    max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
+                    allowSteam=ALLOW_STEAM, max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
     "plan_diff": ("plans/diff", (
         "For a draft made by plan_import or plan_import_current: store what it ADDS to the player's plan as a "
         "proposal; returns {proposalId, basePlanId, summary, text}. The player applies it in game (/gtnhplanner "
@@ -301,6 +336,7 @@ class Service:
     def __init__(self, env=None, opener=OPENER):
         self.env = os.environ if env is None else env
         self.opener = opener
+        self.draft_steam = {}   # planId -> whether plan_create allowed steam machines (tools-side; see STEAM_MACHINES)
 
     def settings(self):
         """(api base, token), read at call time; raises PlannerError when either is missing."""
@@ -428,11 +464,16 @@ class Service:
         if missing:
             raise PlannerError("missing argument(s): %s" % ", ".join(missing))
         body = clean(args)
+        steam = None
+        if name in STEAM_TOOLS:
+            body, steam = apply_steam_rule(body, self.draft_steam.get(body.get("planId")))
         if name == "plan_add_cards":
             if not isinstance(body.get("cards"), list):
                 raise PlannerError("cards must be a list")
             body["cards"] = [api_card(c) for c in body["cards"]]
         resp = self.post(endpoint, body)
+        if name == "plan_create" and isinstance(resp, dict) and isinstance(resp.get("planId"), str):
+            self.draft_steam[resp["planId"]] = steam
         if name == "plan_deliver":
             resp = shrink_delivery(resp)
         return fit(compact(resp))
