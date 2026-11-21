@@ -25,8 +25,7 @@ sys.path.insert(0, str(HERE))
 import server  # noqa: E402
 
 TOKEN = "test-token-0123456789"
-EXAMPLES = {n: json.loads((HERE / "testdata" / (n + ".json")).read_text(encoding="utf-8"))
-            for n in ("resources-search", "recipes-search", "recipes-get")}
+EXAMPLES = {f.stem: json.loads(f.read_text(encoding="utf-8")) for f in sorted((HERE / "testdata").glob("*.json"))}
 
 
 class FakeSite:
@@ -136,7 +135,11 @@ class Base(unittest.TestCase):
 class Endpoints(Base):
     def test_built_endpoints_against_the_site_examples(self):
         for name, tool in (("resources-search", "resources_search"), ("recipes-search", "recipes_search"),
-                           ("recipes-get", "recipes_get")):
+                           ("recipes-get", "recipes_get"), ("plans-create", "plan_create"),
+                           ("plans-add-cards", "plan_add_cards"), ("plans-remove-cards", "plan_remove_cards"),
+                           ("plans-set-targets", "plan_set_targets"), ("plans-connect", "plan_connect"),
+                           ("plans-disconnect", "plan_disconnect"), ("plans-get", "plan_get"),
+                           ("plans-solve", "plan_solve")):
             ex = EXAMPLES[name]
             self.site.routes[ex["endpoint"]] = (ex["status"], ex["response"])
             text, err = self.call(tool, **ex["request"])
@@ -150,6 +153,28 @@ class Endpoints(Base):
             self.assertEqual(last["type"], "application/json")
         self.assertTrue(all(TOKEN not in line for line in self.logs))
 
+    def test_example_requests_fit_the_tool_schemas(self):
+        """Every field the site's own examples send is one the tool's schema offers (the API refuses unknown ones)."""
+        tools = {e: n for n, (e, _, _) in server.ENDPOINTS.items()}
+
+        def check(value, sch, where):
+            if not isinstance(value, dict) or "properties" not in sch:
+                return
+            self.assertLessEqual(set(value), set(sch["properties"]), where)
+            for k in sch.get("required", []):
+                self.assertIn(k, value, where)
+            for k, v in value.items():
+                sub = sch["properties"][k]
+                if isinstance(v, list) and "items" in sub:
+                    for i, item in enumerate(v):
+                        check(item, sub["items"], "%s.%s[%d]" % (where, k, i))
+                else:
+                    check(v, sub, where + "." + k)
+
+        for name, ex in EXAMPLES.items():
+            tool = tools[ex["endpoint"]]
+            check(ex["request"], server.ENDPOINTS[tool][2], name)
+
     def test_every_tool_maps_to_its_endpoint(self):
         args = {"resources_search": {"text": "x"}, "recipes_search": {"text": "x"}, "recipes_get": {"recipeId": "r"},
                 "plan_create": {"name": "n"}, "plan_import": {"snapshot": {}},
@@ -159,7 +184,7 @@ class Endpoints(Base):
                                  "to": {"cardId": "b", "resource": {"id": "water", "kind": "fluid"}}},
                 "plan_disconnect": {"planId": "p", "wireId": "w"},
                 "plan_set_targets": {"planId": "p", "targets": [{"resource": "x", "rate": 1.5}]},
-                "plan_get": {"planId": "p"}, "plan_solve": {"planId": "p", "fields": ["summary"]},
+                "plan_get": {"planId": "p"}, "plan_solve": {"planId": "p", "fields": ["unsupplied"]},
                 "plan_expand_inputs": {"planId": "p", "max": 2}, "plan_diff": {"planId": "p"},
                 "plan_deliver": {"planId": "p", "player": {"name": "Steve", "uuid": "u"}}}
         self.assertEqual(set(args), set(server.ENDPOINTS))

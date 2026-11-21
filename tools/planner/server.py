@@ -30,7 +30,7 @@ CALL_WORKERS = 4
 API_PATH = "/api/agent/v1/"
 TIMEOUT = 6                 # seconds, every endpoint ...
 SLOW = {"plans/solve": 10, "plans/expand-inputs": 10}    # ... except the solver's
-MAX_TEXT = 12000            # characters of response JSON handed to Dave
+MAX_TEXT = 16000            # characters of response JSON handed to Dave (the site itself aims at 12 KB)
 MAX_BODY = 64 * 1024        # the API refuses request bodies over 64 KB ...
 MAX_BODY_BY_ENDPOINT = {"plans/import": 512 * 1024}  # ... except plans/import (a plan snapshot)
 DAEMON_TIMEOUT = 10
@@ -82,6 +82,13 @@ CARD = {
 }
 END = {"type": "object", "additionalProperties": False, "required": ["cardId", "resource"],
        "properties": {"cardId": ID, "resource": RESOURCE}}
+END_TO = {"type": "object", "additionalProperties": False, "required": ["cardId"],
+          "properties": {"cardId": ID, "resource": dict(RESOURCE, description=(
+              "Only to pick the input slot when several could take the wire (an 'any of' slot by a member)."))}}
+DRAFT_CONSTRAINTS = dict(CONSTRAINTS, description=(
+    "Kept by the draft for every later add and solve: tierCap caps machine tiers (a tier above it is bad_request), "
+    "banned keeps machines and recipes out, free marks resources as raw on purpose. heat, cleanroom and lowgrav do "
+    "nothing to a draft."))
 
 
 def schema(props, required=()):
@@ -115,8 +122,9 @@ ENDPOINTS = {
         "tiers, parallels, overclock and dials (the settings plan_add_cards takes)."),
         schema({"recipeId": ID}, ["recipeId"])),
     "plan_create": ("plans/create", (
-        "Start an empty draft plan on the planner site; returns {planId}. The draft expires 24 h after its last "
-        "change and a site restart drops it."), schema({"name": {"type": "string"}, "constraints": CONSTRAINTS},
+        "Start an empty draft plan on the planner site; returns {planId, name, expiresAt, constraints}. The draft "
+        "expires 24 h after its last change and a site restart drops it. Set the constraints here: plan_solve "
+        "takes none."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS},
                                                         ["name"])),
     "plan_import": ("plans/import", (
         "Start a draft from a plan snapshot as the planner exports it; returns {planId}. For the plan the player "
@@ -124,28 +132,44 @@ ENDPOINTS = {
         schema({"snapshot": {"type": "object"}}, ["snapshot"])),
     "plan_add_cards": ("plans/add-cards", (
         "Add recipe cards to a draft (recipeIds from recipes_search, machine and dials from recipes_get); returns "
-        "{cardIds}. Wires between cards are made by resource automatically. At most 60 cards per draft."),
+        "{cards, wires, cardCount} with each new card's cardId. Wires between cards are made by resource "
+        "automatically, both ways. Machine and tier default to the cheapest that runs the recipe within tierCap; the "
+        "solver picks machine counts. At most 60 cards per draft; a refused request changes nothing."),
         schema(dict(PLAN, cards={"type": "array", "minItems": 1, "items": CARD}), ["planId", "cards"])),
-    "plan_remove_cards": ("plans/remove-cards", "Remove cards from a draft by id; returns {removed}.",
+    "plan_remove_cards": ("plans/remove-cards", (
+        "Remove cards from a draft by id; returns {removed, wiresRemoved, cardCount, targets}. A target on a "
+        "removed card moves to the next card that makes it."),
                           schema(dict(PLAN, cardIds={"type": "array", "items": ID, "minItems": 1}),
                                  ["planId", "cardIds"])),
     "plan_connect": ("plans/connect", (
-        "Wire one card's output resource to another card's input, overriding the automatic wiring; returns "
-        "{wireId}."), schema(dict(PLAN, **{"from": END, "to": END}), ["planId", "from", "to"])),
-    "plan_disconnect": ("plans/disconnect", "Remove a wire from a draft; returns {removed}.",
+        "Wire one card's output resource to another card's input, when the automatic wiring missed it or after "
+        "plan_disconnect; returns {wire, created} (created false: it already existed)."),
+        schema(dict(PLAN, **{"from": END, "to": END_TO}), ["planId", "from", "to"])),
+    "plan_disconnect": ("plans/disconnect", (
+        "Remove a wire from a draft by wireId; returns {removed}. Automatic wiring won't remake it."),
                         schema(dict(PLAN, wireId=ID), ["planId", "wireId"])),
     "plan_set_targets": ("plans/set-targets", (
-        "Set what a draft must produce: resources and rates per second (replaces the targets); returns "
-        "{targets}."), schema(dict(PLAN, targets={"type": "array", "items": {
+        "Set what a draft must produce: resources and rates per second (replaces the whole list; [] clears it; at "
+        "most 16). Each target sits on the card that makes it; no card making it is no_recipe. Returns {targets}."),
+        schema(dict(PLAN, targets={"type": "array", "maxItems": 16, "items": {
             "type": "object", "additionalProperties": False, "required": ["resource", "rate"],
-            "properties": {"resource": RESOURCE, "rate": {"type": "number", "description": "Per second."}}}}),
+            "properties": {"resource": RESOURCE, "rate": {"type": "number", "exclusiveMinimum": 0, "description": "Per second."}}}}),
             ["planId", "targets"])),
-    "plan_get": ("plans/get", "A draft's cards, wires and targets, compact.", schema(PLAN, ["planId"])),
+    "plan_get": ("plans/get", (
+        "A draft's cards, wires and targets, compact, with cardCount and wireCount. A big draft truncates "
+        "(truncated: true): page it with fields and cardIds."), schema(dict(
+            PLAN, fields={"type": "array", "items": {"type": "string", "enum": ["cards", "wires", "targets"]},
+                          "description": "Only these (default all three)."},
+            cardIds={"type": "array", "items": ID, "description": "Only these cards and the wires touching them."}),
+            ["planId"])),
     "plan_solve": ("plans/solve", (
-        "Solve a draft with the site's solver: summary first (unsupplied raws, byproducts with nowhere to go, total "
-        "EU/t, warnings), then one line per card (machine, tier, count, rates)."),
-        schema(dict(PLAN, fields={"type": "array", "items": {"type": "string"},
-                                  "description": "Only these fields of the answer."}), ["planId"])),
+        "Solve a draft with the site's solver (uses the constraints given at plan_create): solved, targetsMet, "
+        "targets (made vs rate), unsupplied (raw inputs per second, largest first), byproducts, euT, warnings, then "
+        "cards as ROWS laid out by cardColumns: [cardId, recipe, machine, tier, count, in, out, dials?] (count is "
+        "the machines needed, fractional; in/out are per second by resource name)."),
+        schema(dict(PLAN, fields={"type": "array", "items": {"type": "string", "enum": [
+            "targets", "unsupplied", "byproducts", "power", "warnings", "cards"]},
+            "description": "Only these parts (solved and targetsMet always come)."}), ["planId"])),
     "plan_expand_inputs": ("plans/expand-inputs", (
         "For each unsupplied input of a draft (or only resources), up to max recipes ranked by the solver, each "
         "with a one-line reason (EU per item, machines needed, new raws it brings in)."),

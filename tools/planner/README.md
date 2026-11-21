@@ -45,7 +45,7 @@ otherwise says why it was left out.
   `surface_attachment`, as the `bridge` tool of that name does), reads the JSON file and posts it as
   `{snapshot, player?}` to `plans/import`. The answer is the site's (`planId`) plus `attachment` (turn, surface,
   bytes, and `earlier: true` when it is the asker's earlier ask's).
-- Answers come back as compact JSON. One over 12,000 characters is cut, with a first line that says so and suggests
+- Answers come back as compact JSON. One over 16,000 characters (above the site's own 12 KB aim) is cut, with a first line that says so and suggests
   a smaller `limit`.
 - Errors: the site's `{"error": {"code", "message"}}` becomes `planner error <code>: <message>`; a bare 404 becomes
   `<endpoint> is not available on the planner site yet (or the agent API is off).`; a refused connection or a

@@ -159,7 +159,7 @@ recipe-planner. The token reaches the server as a file (`PLANNER_API_TOKEN_FILE`
 | `plan_connect(planId, from, to)` / `plan_disconnect(planId, wireId)` | `plans/connect`, `plans/disconnect` | Override the automatic wiring |
 | `plan_set_targets(planId, targets)` | `plans/set-targets` | `[{resource, rate}]`, per second |
 | `plan_get(planId)` | `plans/get` | Cards, wires, targets |
-| `plan_solve(planId, fields?)` | `plans/solve` | Summary (unsupplied raws, stuck byproducts, EU/t, warnings), then one line per card |
+| `plan_solve(planId, fields?)` | `plans/solve` | Solved and targets met, unsupplied raws, stuck byproducts, EU/t, warnings, then one row per card (`cardColumns`); uses the constraints given at `plan_create` |
 | `plan_expand_inputs(planId, resources?, constraints?, max?)` | `plans/expand-inputs` | Ranked recipes for unsupplied inputs |
 | `plan_diff(planId)` | `plans/diff` | Proposal for an imported draft: `{proposalId, summary}`; applied with `/gtnhplanner apply <id>` or the panel's Apply |
 | `plan_deliver(planId, player: {name, uuid})` | `plans/deliver` | Stores a NEW plan: `{name, id, code, url?}`; the player opens it with `/gtnhplanner open <id>` |
