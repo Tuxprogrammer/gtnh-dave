@@ -16,6 +16,7 @@ echoed. dave/launch/dave_cmd.py registers this server only when both are configu
 
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -337,6 +338,7 @@ class Service:
         self.env = os.environ if env is None else env
         self.opener = opener
         self.draft_steam = {}   # planId -> whether plan_create allowed steam machines (tools-side; see STEAM_MACHINES)
+        self.draft_tier = {}    # planId -> plan_create's tierCap: the tier a card without one runs at (add_cards_at_cap)
 
     def settings(self):
         """(api base, token), read at call time; raises PlannerError when either is missing."""
@@ -452,6 +454,42 @@ class Service:
 
     # ---- dispatch
 
+    def add_cards_at_cap(self, endpoint, body):
+        """plans/add-cards with every card that names no tier set to the draft's tierCap.
+
+        The site would run such a card at the machine's lowest tier, which for a player building at EV means ULV
+        machines. A card the site refuses at the cap (the machine isn't built at that tier) is sent again without
+        it, so the site picks its own tier for that card; the answer's toolNote says which cards those were.
+        """
+        cap = self.draft_tier.get(body.get("planId"))
+        set_at_cap = set()
+        if cap:
+            for i, card in enumerate(body["cards"]):
+                if isinstance(card, dict) and "tier" not in card:
+                    card["tier"] = cap
+                    set_at_cap.add(i)
+        fell_back = []
+        while True:
+            try:
+                resp = self.post(endpoint, body)
+                break
+            except PlannerError as e:
+                m = re.search(r"^planner error (?:bad_request|tier_too_low): cards\[(\d+)\]", str(e))
+                i = int(m.group(1)) if m else -1
+                if i not in set_at_cap:
+                    raise
+                del body["cards"][i]["tier"]
+                set_at_cap.discard(i)
+                fell_back.append(i)
+        if set_at_cap or fell_back:
+            note = "cards without a tier run at the tier cap (%s)" % cap
+            if fell_back:
+                note += "; the site refused %s for cards[%s], so they run at the site's default tier" % (
+                    cap, ", ".join(map(str, sorted(fell_back))))
+            if isinstance(resp, dict):
+                resp["toolNote"] = note
+        return resp
+
     def call(self, name, args):
         """Returns the tool's text; raises PlannerError for a tool error."""
         if name == IMPORT_CURRENT["name"]:
@@ -471,9 +509,13 @@ class Service:
             if not isinstance(body.get("cards"), list):
                 raise PlannerError("cards must be a list")
             body["cards"] = [api_card(c) for c in body["cards"]]
-        resp = self.post(endpoint, body)
+        if name == "plan_add_cards":
+            resp = self.add_cards_at_cap(endpoint, body)
+        else:
+            resp = self.post(endpoint, body)
         if name == "plan_create" and isinstance(resp, dict) and isinstance(resp.get("planId"), str):
             self.draft_steam[resp["planId"]] = steam
+            self.draft_tier[resp["planId"]] = (body.get("constraints") or {}).get("tierCap")
         if name == "plan_deliver":
             resp = shrink_delivery(resp)
         return fit(compact(resp))

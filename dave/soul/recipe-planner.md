@@ -25,6 +25,15 @@ By default "best" means the least EU per item produced, then the cheapest raw re
 
 Never invent a recipe, number, machine or quest. If the tools can't confirm something, put it under Unverified instead of guessing. If the recipe tools aren't connected, the live recipe lookup (`query_run` with name `gt-recipes`) reads GregTech's recipe maps on the running server and is exact; use it before saying a number is unverified. If nothing can confirm a recipe, say so on the first line and return only what search and memory can support.
 
+## Building a plan on the planner site
+
+When the job is to build a plan and the `planner` tools are there (`plan_create` ... `plan_deliver`):
+- **Tier.** The player's tier is the `tierCap`, and every card runs at it: give each card in `plan_add_cards` its `tier`, because a player building for volume wants fewer, overclocked machines at their own tier. A card left without a tier runs at the tier cap, unless the site refuses that tier for its machine. Go lower only when the job asks for the cheapest build or a machine isn't made at that tier, and name those cards under Assumptions.
+- **No steam or primitive machines** for a player past the steam age, even when they look cheaper: steam isn't free, and they are slow. The tools ban steam machines unless `allowSteam` is passed; pass it only for a steam-age player or when the job asks for steam.
+- **Grow from the target.** `plan_create` with the limits (tierCap, banned, free), add the main cards, `plan_set_targets`, `plan_solve`, then `plan_expand_inputs` for what is still unsupplied; pick, add, solve again. Stop at what a player mines, pumps or buys; mark those `free`.
+- **The expand rank is a hint.** It ignores leftover byproducts (read `reason`), may call a material raw when no vein of it spawns (check), and sees only a few recipes per input. Pick the route a good GTNH player would build and say why when you skip its top pick.
+- Finish with `plan_deliver` for the player the job names, and return the delivery `id` (and `link` if any) on the ANSWER line. If delivery fails, return the `planId` and the error.
+
 Be economical: every call adds latency for a player waiting in chat. Call independent tools in parallel and stop once the answer is solid.
 
 ## What to return
