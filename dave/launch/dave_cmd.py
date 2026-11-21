@@ -136,24 +136,30 @@ def _write(path, text, mode=0o644):
     os.replace(tmp, path)
 
 
-def openrouter_key_file(cfg, run_dir):
-    """A file the gtnh-search server can read the key from, so the key itself is never in Claude's env.
+def secret_as_file(cfg, run_dir, name):
+    """A file an MCP server can read the secret `name` from, so the secret itself is never in Claude's env.
 
-    A docker secret / OPENROUTER_API_KEY_FILE is passed through as is. A key from the environment or from the dev
-    .env is written to <run>/secrets/ (0600, runtime only): a _FILE must hold the bare key, and the .env file holds
-    `NAME=value` lines (passing it as the file made every search call fail with 401).
+    A docker secret / NAME_FILE is passed through as is. A value from the environment or from the dev .env is
+    written to <run>/secrets/<name> (0600, runtime only): a _FILE must hold the bare value, and the .env file holds
+    `NAME=value` lines (passing it as the file made every search call fail with 401). Returns (path, note) or
+    (None, None) when the secret is not set.
     """
-    path = config.secret_file(cfg, "openrouter_api_key")
+    path = config.secret_file(cfg, name)
     if path:
         return path, "file"
-    value, source = config.secret(cfg, "openrouter_api_key")
+    value, source = config.secret(cfg, name)
     if not value:
         return None, None
-    dest = run_dir / "secrets" / "openrouter_api_key"
+    dest = run_dir / "secrets" / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(dest.parent, 0o700)
     _write(dest, value + "\n", 0o600)
     return dest, "written from " + source.split(" ", 1)[0] + (" .env" if source.startswith("dev") else "")
+
+
+def openrouter_key_file(cfg, run_dir):
+    """The gtnh-search / living-wiki key file (see secret_as_file)."""
+    return secret_as_file(cfg, run_dir, "openrouter_api_key")
 
 
 def build(cfg=None, mode="stream", prompt=None, write=True, resume=None):
@@ -175,6 +181,8 @@ def build(cfg=None, mode="stream", prompt=None, write=True, resume=None):
     prompt_text, prompt_notes = assemble_prompt(cfg)
     notes += prompt_notes
     key_file, key_note = openrouter_key_file(cfg, run_dir) if write else (None, None)
+    planner_url = (cfg.get("planner", {}).get("url") or "").strip()
+    planner_token = secret_as_file(cfg, run_dir, "planner_api_token")[0] if write and planner_url else None
     values = {
         "PYTHON": sys.executable, "APP": cfg["app"], "ROOT": cfg["root"], "CONFIG": cfg["config_path"],
         "GTNH_SRC": paths["gtnh_src"], "CORPUS": paths["corpus"], "INDEX": paths["index"],
@@ -182,6 +190,8 @@ def build(cfg=None, mode="stream", prompt=None, write=True, resume=None):
         "SEARCH_STATE": cfg["search"]["state"],
         "RECIPES": paths.get("recipes") or cfg["root"] / "data" / "recipes.sqlite",
         "BRIDGE_SOCKET": config.bridge_socket(cfg),      # the daemon's RPC socket (dave/daemon/rpc.py)
+        "PLANNER_URL": planner_url,                  # the planner site's agent API (tools/planner)
+        "PLANNER_TOKEN_FILE": planner_token or "",
         "PLANNER_MODEL": cfg["model"]["planner"],
         "PLANNER_PROMPT": strip_comments(Path(cfg["prompt"]["planner"]).read_text(encoding="utf-8")),
     }
@@ -193,6 +203,11 @@ def build(cfg=None, mode="stream", prompt=None, write=True, resume=None):
         if script and not Path(script).is_file():
             del mcp["mcpServers"][name]
             notes.append("MCP server %s left out: %s does not exist yet" % (name, script))
+            continue
+        unset = [k for k in server.pop("_requires", []) if not server.get("env", {}).get(k)]
+        if unset:
+            del mcp["mcpServers"][name]
+            notes.append("MCP server %s left out: not configured (%s empty)" % (name, ", ".join(unset)))
     for name, agent in agents.items():           # an agent may only name tools of registered MCP servers
         keep = [t for t in agent["tools"] if not t.startswith("mcp__") or t.split("__")[1] in mcp["mcpServers"]]
         if len(keep) != len(agent["tools"]):

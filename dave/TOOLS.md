@@ -34,7 +34,7 @@ checked result (ANSWER / CHAIN / TOTALS / RUNNER-UP / ...) that Dave turns into 
 
 | Field | Value |
 |---|---|
-| `tools` | Read, Grep, Glob, `gtnh_search`, `wiki_get` (living-wiki, read-only), `memory_recall`, `memory_get`, `player_get` (memory read-only), `query_run` and `query_list` (bridge), and the `recipes` tools (`recipe_producers`, `recipe_uses`, `recipe_get`, `item_find`, `plan_chain`). Tools of MCP servers that aren't registered are dropped at render time |
+| `tools` | Read, Grep, Glob, `gtnh_search`, `wiki_get` (living-wiki, read-only), `memory_recall`, `memory_get`, `player_get` (memory read-only), `query_run` and `query_list` (bridge), the `recipes` tools (`recipe_producers`, `recipe_uses`, `recipe_get`, `item_find`, `plan_chain`) and every `planner` tool. Tools of MCP servers that aren't registered are dropped at render time |
 | `maxTurns` | 40 |
 | `omitClaudeMd` | true (on top of the global CLAUDE.md shutdown) |
 
@@ -134,6 +134,40 @@ longer. Its furnace, coke oven and yield boosts are not in the database.
 Item ids: `<mod>:<name>[@meta]` (lowercase, meta 0 omitted), `fluid:<name>`, `aspect:<tag>`, `ore:<oredict>`.
 Allowed with `mcp__recipes`; `recipe-planner` gets all five.
 
+## MCP: `planner` (live when configured; `tools/planner/`)
+
+`tools/planner/server.py`, standard library only: the self-hosted GTNH planner website's **agent API**
+([spec](https://github.com/Tuxprogrammer/gtnh-factory-flow/blob/main/docs/agent-api.md)), one tool per endpoint. It
+looks recipes up in the planner's own dataset and builds plans (drafts) on the site with its solver, so Dave can
+hand a player a plan they open in the in-game planner. Setup and errors: `tools/planner/README.md`.
+
+**Registered only when configured.** `[planner] url` (`DAVE_PLANNER_URL`) and the `planner_api_token` secret
+(`PLANNER_API_TOKEN`, `PLANNER_API_TOKEN_FILE`, docker secret `planner_api_token`, or `dave/.env` in dev) must both
+be set; otherwise `dave_cmd.py` leaves the server out (its `_requires` in `launch/mcp.json`) and drops its tools from
+recipe-planner. The token reaches the server as a file (`PLANNER_API_TOKEN_FILE`), never in Claude's environment.
+
+| Tool | Endpoint | Does |
+|---|---|---|
+| `resources_search(text, kind?, limit?)` | `resources/search` | Items and fluids by name: the planner ids every other tool takes |
+| `recipes_search(makes?, takes?, text?, machine?, constraints?, limit?, offset?, detail?)` | `recipes/search` | Recipes that make or take a resource, or by name; constraints `{tierCap, heat, cleanroom, lowgrav, banned, free}` |
+| `recipes_get(recipeId)` | `recipes/get` | One recipe with every machine that runs it and its dials |
+| `plan_create(name, constraints?)` | `plans/create` | Empty draft: `{planId}` |
+| `plan_import(snapshot)` | `plans/import` | Draft from a plan snapshot |
+| `plan_import_current(turn?)` | `plans/import` | Draft from the plan attached to this panel ask (`surface_attachment` through the daemon socket) |
+| `plan_add_cards(planId, cards)` | `plans/add-cards` | Cards `{recipeId, machine?, tier?, dials?: {dialId: value}}`; wired by resource automatically |
+| `plan_remove_cards(planId, cardIds)` | `plans/remove-cards` | |
+| `plan_connect(planId, from, to)` / `plan_disconnect(planId, wireId)` | `plans/connect`, `plans/disconnect` | Override the automatic wiring |
+| `plan_set_targets(planId, targets)` | `plans/set-targets` | `[{resource, rate}]`, per second |
+| `plan_get(planId)` | `plans/get` | Cards, wires, targets |
+| `plan_solve(planId, fields?)` | `plans/solve` | Summary (unsupplied raws, stuck byproducts, EU/t, warnings), then one line per card |
+| `plan_expand_inputs(planId, resources?, constraints?, max?)` | `plans/expand-inputs` | Ranked recipes for unsupplied inputs |
+| `plan_diff(planId)` | `plans/diff` | Proposal for an imported draft: `{proposalId, summary}`; applied with `/gtnhplanner apply <id>` or the panel's Apply |
+| `plan_deliver(planId, player: {name, uuid})` | `plans/deliver` | Stores a NEW plan: `{name, id, code, url?}`; the player opens it with `/gtnhplanner open <id>` |
+
+Every tool also takes `player: {name, uuid?}`, passed to the site for its audit log. Drafts expire 24 h after their
+last change, and a site restart drops them (`plan_not_found`). Endpoints the site has not built yet answer that they
+are not available. Allowed with `mcp__planner`; `recipe-planner` gets all of them.
+
 ## MCP: `bridge` (live; owner: the daemon, M2)
 
 `dave/bridge/server.py`, a stdio MCP server Claude starts like the others. It holds no connection of its own: each
@@ -194,8 +228,8 @@ a `<surface>` element and every reply goes privately to that panel (`ENVELOPE.md
   its data in a `<data>{...}</data>` block instead.
 - `surface_attachment(turn?)` returns `{"path", "turn", "surface", "requestId", "bytes"}` for this turn's
   attachment, else the asker's newest (`"earlier": true`), or turn `turn`'s. The file is
-  `<run>/surface/<turn id>.json`; the newest 50 are kept. Tools (a future `planner` MCP server's
-  `plan_import_current()`) read the file from there; its content is never in Dave's prompt.
+  `<run>/surface/<turn id>.json`; the newest 50 are kept. Tools (the `planner` server's `plan_import_current`)
+  read the file from there; its content is never in Dave's prompt.
 
 ### `lesson` / `lesson_stop` (guided demonstrations)
 
@@ -250,7 +284,9 @@ in the private project). Against an older DaveBridge the tools answer that they 
 ## Adding a tool (checklist)
 
 1. Server script exists and passes its own tests.
-2. Entry in `launch/mcp.json` (paths as `${APP}`, `${ROOT}` and so on; secrets as file paths, never values).
+2. Entry in `launch/mcp.json` (paths as `${APP}`, `${ROOT}` and so on; secrets as file paths, never values). A
+   server that needs configuration lists the env values it can't run without in `_requires`; `dave_cmd.py` leaves
+   it out while any of them is empty.
 3. `mcp__<server>` (or per-tool `mcp__<server>__<tool>`) in the `allow` list of `launch/settings.json`;
    anything Dave should never call goes in `deny`.
 4. Update this file. Change SOUL.md only if Dave needs a new habit, not a new tool name.

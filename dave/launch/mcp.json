@@ -1,5 +1,5 @@
 {
-  "_comment": "Template. dave_cmd.py fills in the placeholders, drops servers whose script does not exist yet, and passes the result via --mcp-config with --strict-mcp-config.",
+  "_comment": "Template. dave_cmd.py fills in the placeholders, drops servers whose script does not exist yet or whose _requires env values are empty (not configured), strips _ keys, and passes the result via --mcp-config with --strict-mcp-config.",
   "mcpServers": {
     "dave-memory": {
       "type": "stdio",
@@ -42,6 +42,17 @@
       "env": {
         "DAVE_BRIDGE_SOCKET": "${BRIDGE_SOCKET}"
       }
+    },
+    "planner": {
+      "type": "stdio",
+      "command": "${PYTHON}",
+      "args": ["-I", "${APP}/tools/planner/server.py"],
+      "env": {
+        "PLANNER_API_URL": "${PLANNER_URL}",
+        "PLANNER_API_TOKEN_FILE": "${PLANNER_TOKEN_FILE}",
+        "DAVE_BRIDGE_SOCKET": "${BRIDGE_SOCKET}"
+      },
+      "_requires": ["PLANNER_API_URL", "PLANNER_API_TOKEN_FILE"]
     },
     "living-wiki": {
       "type": "stdio",

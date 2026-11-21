@@ -69,6 +69,12 @@ bin = "claude"                             # DAVE_CLAUDE_BIN   resolved on PATH 
 # Production: the volume, e.g. /dave/data/state. The baked corpus/index above then act as the read-only seed.
 state = ""                                 # DAVE_SEARCH_STATE
 
+[planner]
+# The self-hosted GTNH planner site's agent API (tools/planner/, the `planner` MCP server). The server is
+# registered only when this URL AND the planner_api_token secret below are both set; empty = no planner tools.
+url = ""                                   # DAVE_PLANNER_URL  base URL on the internal network, e.g.
+                                           #                   http://planner:3000 (the API is under /api/agent/v1/)
+
 [bridge]
 # Used by the daemon. Dev: the local runServer. Production: the stack's internal network, e.g. ws://gtnh:25580
 url = "ws://127.0.0.1:25580"               # DAVE_BRIDGE_URL
@@ -86,3 +92,5 @@ keep = 5                                   # rotated copies kept per file (turns
 claude_oauth_token = { env = "CLAUDE_CODE_OAUTH_TOKEN", docker_secret = "claude_oauth_token", dev_env_file = "dave/.env" }
 openrouter_api_key = { env = "OPENROUTER_API_KEY",      docker_secret = "openrouter_api_key", dev_env_file = ".env" }
 bridge_token       = { env = "DAVE_BRIDGE_TOKEN",       docker_secret = "dave_token",         dev_env_file = "dave/.env" }
+# The planner site's AGENT_API_TOKEN. Handed to the planner MCP server as a file (PLANNER_API_TOKEN_FILE), never as a value.
+planner_api_token  = { env = "PLANNER_API_TOKEN",       docker_secret = "planner_api_token",  dev_env_file = "dave/.env" }

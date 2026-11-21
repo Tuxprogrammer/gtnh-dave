@@ -34,6 +34,7 @@ ENV = {
     ("claude", "bin"): "DAVE_CLAUDE_BIN",
     ("bridge", "url"): "DAVE_BRIDGE_URL",
     ("search", "state"): "DAVE_SEARCH_STATE",
+    ("planner", "url"): "DAVE_PLANNER_URL",
 }
 
 
