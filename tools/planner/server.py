@@ -173,9 +173,14 @@ ENDPOINTS = {
             "targets", "unsupplied", "byproducts", "power", "warnings", "cards"]},
             "description": "Only these parts (solved and targetsMet always come)."}), ["planId"])),
     "plan_expand_inputs": ("plans/expand-inputs", (
-        "For each unsupplied input of a draft (or only resources), up to max recipes ranked by the solver, each "
-        "with a one-line reason (EU per item, machines needed, new raws it brings in)."),
-        schema(dict(PLAN, resources={"type": "array", "items": RESOURCE}, constraints=CONSTRAINTS,
+        "What could make each input a draft still needs (it must have a target): up to max candidates per input, "
+        "each actually tried in a copy of the draft and solved, with machines, euPerItem, newRaws, "
+        "usesByproducts, works and a plain reason. Inputs marked raw: true may stay unsupplied; accepted lists "
+        "the free ones. Up to 6 inputs per call: more: true and remaining mean page on with resources. The rank "
+        "ignores leftover byproducts (named in reason), calls some never-spawning ore materials raw, shows steam "
+        "machines at 0 EU and sees only the first 12 recipes per input: judge it, don't just take the top one. "
+        "Add your choice with plan_add_cards and its recipeId. constraints apply to this call only."),
+        schema(dict(PLAN, resources={"type": "array", "items": RESOURCE, "maxItems": 16}, constraints=CONSTRAINTS,
                     max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
     "plan_diff": ("plans/diff", (
         "For a draft made by plan_import or plan_import_current: store what it ADDS to the player's plan as a "
@@ -186,7 +191,8 @@ ENDPOINTS = {
         "bad_request too."), schema(PLAN, ["planId"])),
     "plan_deliver": ("plans/deliver", (
         "Store a finished draft for the player as a NEW plan (kept 30 days); returns {name, id, cardCount, "
-        "expiresAt}. Give the player the id: they open it in game with /gtnhplanner open <id>. The plan code and "
+        "expiresAt, link?}. Give the player the id: they open it in game with /gtnhplanner open <id>; link (when "
+        "present) opens it on the site. The plan code and "
         "its site link run to thousands of characters, so they are left out unless short. It never changes the "
         "player's own designs and is not a community post. player needs name and uuid (the asker's)."),
         dict(schema(PLAN, ["planId", "player"]), properties=dict(PLAN, player=dict(

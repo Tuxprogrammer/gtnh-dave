@@ -140,7 +140,7 @@ class Endpoints(Base):
                            ("plans-set-targets", "plan_set_targets"), ("plans-connect", "plan_connect"),
                            ("plans-disconnect", "plan_disconnect"), ("plans-get", "plan_get"),
                            ("plans-solve", "plan_solve"), ("plans-import", "plan_import"),
-                           ("plans-diff", "plan_diff")):
+                           ("plans-diff", "plan_diff"), ("plans-expand-inputs", "plan_expand_inputs")):
             ex = EXAMPLES[name]
             self.site.routes[ex["endpoint"]] = (ex["status"], ex["response"])
             text, err = self.call(tool, **ex["request"])
