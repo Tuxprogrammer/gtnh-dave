@@ -8,6 +8,7 @@ import net.minecraftforge.client.ClientCommandHandler;
 import com.tuxprogrammer.davebridge.DaveBridge;
 import com.tuxprogrammer.davebridge.client.lesson.LessonClient;
 import com.tuxprogrammer.davebridge.common.CommonProxy;
+import com.tuxprogrammer.davebridge.common.SurfaceHook;
 import com.tuxprogrammer.davebridge.common.network.DaveNetwork;
 import com.tuxprogrammer.davebridge.common.protocol.ClientEvalRequest;
 import com.tuxprogrammer.davebridge.common.protocol.DaveMessage;
@@ -88,6 +89,33 @@ public class ClientProxy extends CommonProxy {
             .bus()
             .register(new ClientEventHandler());
         LessonClient.preInit(); // guided demonstrations
+        SurfaceHook.install(new SurfaceHook.Backend() { // api.DaveBridgeClientApi
+
+            @Override
+            public boolean available() {
+                return SurfaceClient.available();
+            }
+
+            @Override
+            public String ask(String surface, String text, String contextJson, String attachmentJson) {
+                return SurfaceClient.ask(surface, text, contextJson, attachmentJson);
+            }
+
+            @Override
+            public void cancel(String requestId) {
+                SurfaceClient.cancel(requestId);
+            }
+
+            @Override
+            public void listen(String surface, java.util.function.Consumer<String> listener) {
+                SurfaceClient.listen(surface, listener);
+            }
+
+            @Override
+            public void unlisten(String surface, java.util.function.Consumer<String> listener) {
+                SurfaceClient.unlisten(surface, listener);
+            }
+        });
     }
 
     static boolean hasFeature(String[] features, String feature) {

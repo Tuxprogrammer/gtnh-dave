@@ -206,17 +206,21 @@ public final class DaveChat {
      */
     public static SayResult saySurface(String target, String text, String markup, JsonElement components, String error,
         String surface, String requestId, boolean isFinal, JsonElement data) throws ProtocolException {
-        if (isEveryone(target)) {
+        List<EntityPlayerMP> recipients = isEveryone(target) ? new ArrayList<>() : resolveTargets(target);
+        EntityPlayerMP player = recipients.isEmpty() ? null : recipients.get(0);
+        SurfaceRoute route = surfaceRoute(
+            target,
+            player != null,
+            player != null && DaveServer.CLIENTS.hasCapability(player.getUniqueID(), Surfaces.FEATURE));
+        List<String> warnings = new ArrayList<>();
+        if (route == SurfaceRoute.REFUSED) {
             throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "a surface reply needs a player target");
         }
-        List<EntityPlayerMP> recipients = resolveTargets(target);
-        List<String> warnings = new ArrayList<>();
-        if (recipients.isEmpty()) {
+        if (route == SurfaceRoute.DROPPED) {
             warnings.add("player '" + target + "' is not online; the surface reply was dropped");
             return new SayResult(0, warnings);
         }
-        EntityPlayerMP player = recipients.get(0);
-        if (!DaveServer.CLIENTS.hasCapability(player.getUniqueID(), Surfaces.FEATURE)) {
+        if (route == SurfaceRoute.WHISPER) {
             warnings.add(
                 "player '" + target
                     + "' has no client that shows "
@@ -226,6 +230,9 @@ public final class DaveChat {
             if (error != null) {
                 player.addChatMessage(notice(error));
                 return new SayResult(1, warnings);
+            }
+            if (text == null && markup == null && components == null) {
+                return new SayResult(0, warnings); // data only: nothing a plain client can show
             }
             SayResult whisper = say(target, text, markup, components, null);
             warnings.addAll(whisper.warnings);
@@ -292,6 +299,28 @@ public final class DaveChat {
             message.finalReply ? "" : ", interim",
             message.error != null ? "error: " + message.error : message.text);
         return new SayResult(1, warnings);
+    }
+
+    /** Where a surface reply goes. Never public chat: an {@code @a} target is refused. */
+    enum SurfaceRoute {
+        /** to the asker's panel as a dave_message */
+        PANEL,
+        /** the asker's client cannot show it in a panel: an ordinary whisper */
+        WHISPER,
+        /** the asker is not online */
+        DROPPED,
+        /** no single player named */
+        REFUSED
+    }
+
+    static SurfaceRoute surfaceRoute(String target, boolean online, boolean surfaceCapable) {
+        if (isEveryone(target)) {
+            return SurfaceRoute.REFUSED;
+        }
+        if (!online) {
+            return SurfaceRoute.DROPPED;
+        }
+        return surfaceCapable ? SurfaceRoute.PANEL : SurfaceRoute.WHISPER;
     }
 
     /** A surface error to one player, from the server itself (refused ask, Dave offline). Server thread. */

@@ -100,18 +100,20 @@ class SurfacePacketRoundTripTest {
         String json = new String(DaveNetwork.encode(m), StandardCharsets.UTF_8);
         JsonObject wire = new JsonParser().parse(json)
             .getAsJsonObject();
-        assertTrue(wire.get("final")
-            .getAsBoolean(), json);
+        assertTrue(
+            wire.get("final")
+                .getAsBoolean(),
+            json);
         assertFalse(wire.has("finalReply"), json);
         assertFalse(wire.has("error"), "null fields are left out: " + json);
-        DaveMessage got = (DaveMessage) DaveNetwork.decode(
-            DaveMessage.KIND,
-            json.getBytes(StandardCharsets.UTF_8),
-            DavePackets.Direction.TO_CLIENT);
+        DaveMessage got = (DaveMessage) DaveNetwork
+            .decode(DaveMessage.KIND, json.getBytes(StandardCharsets.UTF_8), DavePackets.Direction.TO_CLIENT);
         assertTrue(got.finalReply);
-        assertEquals("p7", got.data.getAsJsonObject()
-            .get("proposalId")
-            .getAsString());
+        assertEquals(
+            "p7",
+            got.data.getAsJsonObject()
+                .get("proposalId")
+                .getAsString());
         assertEquals(1, got.components.length);
     }
 
@@ -120,7 +122,9 @@ class SurfacePacketRoundTripTest {
         AskCancel c = new AskCancel();
         c.requestId = "r9";
         byte[] data = DaveNetwork.encode(c);
-        assertEquals("r9", ((AskCancel) DaveNetwork.decode(AskCancel.KIND, data, DavePackets.Direction.TO_SERVER)).requestId);
+        assertEquals(
+            "r9",
+            ((AskCancel) DaveNetwork.decode(AskCancel.KIND, data, DavePackets.Direction.TO_SERVER)).requestId);
         assertThrows(
             IllegalArgumentException.class,
             () -> DaveNetwork.decode(AskCancel.KIND, data, DavePackets.Direction.TO_CLIENT));

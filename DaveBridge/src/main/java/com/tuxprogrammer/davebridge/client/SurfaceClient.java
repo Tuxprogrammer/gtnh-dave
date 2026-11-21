@@ -27,7 +27,8 @@ import com.tuxprogrammer.davebridge.common.protocol.Thinking;
  * Surface asks on the client: questions another mod's panel sends through {@code api.DaveBridgeClientApi}, and the
  * replies routed back to that panel's listeners instead of chat (PROTOCOL.md 2.7).
  * <p>
- * Uses no {@code net.minecraft.client} class, so the API class can reference it without side-safety concerns. Events
+ * Reached from {@code api.DaveBridgeClientApi} through {@code common.SurfaceHook}, installed by {@link ClientProxy}.
+ * Events
  * are delivered on the client thread (packet handlers queue them on {@link ClientProxy#QUEUE}).
  */
 public final class SurfaceClient {
