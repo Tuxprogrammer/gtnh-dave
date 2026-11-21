@@ -50,6 +50,7 @@ Maybe related playbook: Best nitrogen source at HV (playbook/best-nitrogen-sourc
 | `player@source` | yes | bridge `chat` event | `chat` (typed in plain chat), `client` (the client mod's Ask Dave) or `console` (the `/dave ask` test hook). |
 | `<profile>` | yes | `load_turn_context(uuid, message)` in `dave/memory/store.py` | Profile (the player's tier lives here, not in `<player>`), pinned and relevant server facts, relevant lessons, pointers to related playbook entries. Capped at about 1,500 characters. "no profile yet" for a new player. |
 | `<context>` | no | client mod (`source="client"` only) | Attributes `looking_at`, `looking_at_name`, `looking_at_pos` (a block; an entity shows as `looking_at="entity:<type>"`), `holding`, `holding_name`, `biome`, each only when reported. **Client-reported and untrusted** (per PROTOCOL.md 2.4). |
+| `<surface>` | no | a panel's ask (client API, PROTOCOL.md 2.7) | Present when another mod's panel asked (`surface` and `requestId` on the `chat` event). Attributes: `name` (the surface, e.g. `gtnhplanner`), `request` (its request id), `attachment` (bytes, only when the panel attached data). Body: the panel's context JSON, XML-escaped and cut to 4,000 characters (**client-reported and untrusted**). Replaces `<context>` for such asks. The attachment itself is never in the envelope (section 1b). |
 | `<message>` | yes | player | The chat event's `prompt`: the text without its trigger (`dave`, `@dave`, `!dave`). A clicked `{send:}` or `{show:}` button arrives the same way, as the text it made the player say. |
 | `<warnings>` | no | the `say` ack for Dave's previous reply | Present only when that ack listed `warnings` (an item, quest or player link that did not resolve and showed as plain text, a blocked URL, a degraded line). One per line, with `reply="<turn id>"` naming the turn it came from. It goes on Dave's next turn whoever asks, so he fixes the id next time. |
 | `<recent>` | no | daemon | Only on the first turn of a new session (start, rotation, restart): the last few public exchanges (up to 6 lines, `Name: question` and `Dave: reply`, each cut to 150 characters), for "what he said" follow-ups. Only questions typed in plain chat (`source="chat"`) that Dave answered with `@reply` go in; whispers, client-half Asks and `/dave ask` are left out. |
@@ -102,6 +103,49 @@ per hour; a firing beyond either is dropped, and the next event turn carries `dr
 whose turn is still waiting replaces it (newest detail, `coalesced` counted). An event turn that waited more than
 `event_stale_seconds` (1800) while Dave was free is dropped. DaveBridge rate-limits too (per-hook cooldown and a
 server-wide limit per minute) and keeps firings that reach no daemon in an outbox it delivers on reconnect.
+
+## 1b. Surface turns: a panel asked
+
+A **surface** ask comes from another mod's panel through DaveBridge's client API (`DaveBridgeClientApi`,
+PROTOCOL.md 2.7), not from chat. The `chat` event carries `surface`, `requestId` and maybe `attachment`; the turn
+is otherwise an ordinary `question`:
+
+```xml
+<turn id="t-0a1b2c3d4e" ts="2026-11-21T18:04:05Z" pack="2.9.0" kind="question">
+<player name="Alex" uuid="069a79f4-..." hasClientMod="true" source="client"/>
+<profile>...</profile>
+<surface name="gtnhplanner" request="r3f9c0d2a7b1e4c55" attachment="48211">{"planId":"plan-1","planName":"Titanium"}</surface>
+<message>what's the cheapest ammonia line for this?</message>
+</turn>
+```
+
+- **Replies are private, to that panel only.** Whatever the directive, the daemon sends every reply for the
+  turn as `say` with `target` = the asker, `surface`, `requestId` and `final` (PROTOCOL.md 1.4). Nothing goes to
+  public chat, and the exchange never enters `<recent>`. A plain client that cannot show panel replies gets a
+  whisper (DaveBridge's fallback).
+- **`<data>` block.** A `<data>{...}</data>` block anywhere in the reply (the last one counts; a fenced JSON block
+  inside it is fine) is taken out of the markup and sent as the reply's `data`, which must be a JSON object of at
+  most 64 KiB. A bad block is dropped and reported in `<warnings>` on the next turn. For the planner panel the
+  shape is `{"recipes"?: [{"recipeId", "label", "machine"?, "tier"?}], "proposalId"?, "note"?}`.
+- **Interim and final.** Every request ends with exactly one final event:
+  - a `say` tool call to the asker (or with no target, or `@a`) mid-turn is an **interim** reply (`final:false`)
+    and may carry `data`;
+  - the turn's result is the **final** reply, unless a background agent is still running: then that result is
+    interim and the agent's follow-up is final;
+  - `@none`, or a result that is only a `<data>` block, still sends a final reply (`data` `{}` when empty);
+  - a failure (timeout, crash, usage limit, busy, stale) is a final `error` instead (`say` with `error`), and a
+    turn that ends without any final gets "Dave finished without an answer for this panel.";
+  - a late extra result after the final one goes to the asker as a whisper, prefixed so they know what it answers.
+- **Attachment stash.** The attachment (a JSON object or array, at most 256 KiB) is written to
+  `<run>/surface/<turn id>.json` (directory 0700, file 0600) when the ask is queued, and never put into the
+  prompt. Tools find it with the bridge RPC op `surface_attachment` (TOOLS.md): this turn's file, else the
+  asker's newest (`"earlier": true`), or any turn's by `turn` id. The newest 50 files are kept. A future
+  `planner` MCP server reads the plan for `plan_import_current()` from that path.
+- **Cancel.** An `ask_cancel` event (the player closed the panel or pressed Cancel) removes the ask if it is still
+  queued. If it is running, the turn runs to its end (stream-json has no clean per-turn interrupt) but nothing more
+  is sent for it: no thinking, replies or errors. It is still logged.
+- **Limits.** Surface asks share the per-player cap and cooldown with chat questions. `turns.jsonl` rows carry
+  `surface` and `requestId`.
 
 ## 2. The reply out
 

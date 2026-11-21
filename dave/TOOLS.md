@@ -152,7 +152,8 @@ eval and lessons, so a confirm always goes to the person who asked. Claude may n
 | `query_run(name, params?, summary?, timeout_ms?)` | A saved query (below) |
 | `query_list()` / `query_get(name)` | What saved queries exist / one in full |
 | `query_save(name, description, script, mode?, side?, params_doc?, timeout_ms?, replace?)` | Save a script that worked |
-| `say(markup, target="@a")` | Post mid-turn (progress on a long job). Normal replies are the turn's final text |
+| `say(markup?, target="@a", data?)` | Post mid-turn (progress on a long job). Normal replies are the turn's final text. During a panel's ask (`<surface>`) it goes privately to that panel as an interim reply, never to chat, and may carry `data` (or only `data`); see below |
+| `surface_attachment(turn?)` | Where a panel's attachment is stashed (a 0600 JSON file): path, turn, surface, requestId, bytes. See below |
 | `list_players()` | Who is online |
 | `lesson(lesson, player?)` | Show one player a guided demonstration ("show me"); see below |
 | `lesson_stop(player?, id?)` | Stop that player's demonstration |
@@ -180,6 +181,21 @@ compiles every starter with the server's engine settings on each build.
 
 Allowed in `launch/settings.json` as `mcp__bridge`. The `recipe-planner` subagent gets `query_run` and
 `query_list` (read lookups such as `gt-recipes`), not raw `eval`.
+
+### Panel asks: `say` with `data`, `surface_attachment`
+
+Another mod's panel can ask Dave through DaveBridge's client API (`DaveBridge/PROTOCOL.md` 2.7); such a turn has
+a `<surface>` element and every reply goes privately to that panel (`ENVELOPE.md` 1b).
+
+- `say(markup?, data?)` during such a turn, with no target, `@a` or the asker as target, is an **interim** reply to
+  the panel (`final:false`). `data` is a JSON object of at most 64 KiB. For `gtnhplanner`:
+  `{"proposalId"?: "...", "recipes"?: [{"recipeId": "...", "label": "...", "machine"?: "...", "tier"?: "HV"}],
+  "note"?: "..."}`. Outside a panel turn `data` is dropped (the result says so). The turn's final answer carries
+  its data in a `<data>{...}</data>` block instead.
+- `surface_attachment(turn?)` returns `{"path", "turn", "surface", "requestId", "bytes"}` for this turn's
+  attachment, else the asker's newest (`"earlier": true`), or turn `turn`'s. The file is
+  `<run>/surface/<turn id>.json`; the newest 50 are kept. Tools (a future `planner` MCP server's
+  `plan_import_current()`) read the file from there; its content is never in Dave's prompt.
 
 ### `lesson` / `lesson_stop` (guided demonstrations)
 

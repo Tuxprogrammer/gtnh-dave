@@ -9,6 +9,7 @@ Reads one user message per stdin line and answers by keyword in the envelope's <
   BGFAST   the same with the follow-up written straight after the first result (no delay)
   BGQUIET  a second result 0.5 s later with no task_started announcing it
   JUNK     emit non-object JSON lines and an over-long line before answering
+  DATA     "@reply\\nTry the Haber line, <player>" with a <data>{"proposalId":"p1",...}</data> block
   WHISPER  "@whisper\\n..."     NONE  "@none"     NODIR  an answer with no directive line
   ERROR    a result with is_error
 otherwise "@reply\\nhello <player>" plus flags: "warn" if the envelope had <warnings>, "recent" if <recent>.
@@ -100,6 +101,10 @@ for line in sys.stdin:
         if not fast:
             time.sleep(0.5)
         result("@reply\nPlanner says: air centrifuge, " + name)
+        continue
+    if "DATA" in msg:
+        result('@reply\nTry the Haber line, ' + name + '\n<data>{"proposalId":"p1","recipes":[{"recipeId":"r-nh3",'
+               '"label":"Ammonia"}]}</data>')
         continue
     if "WHISPER" in msg:
         result("@whisper\npsst " + name)

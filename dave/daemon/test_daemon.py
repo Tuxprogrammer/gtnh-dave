@@ -76,6 +76,31 @@ class EnvelopeTests(unittest.TestCase):
         self.assertIn("<error>boom &lt;x&gt;</error>", dis)
         self.assertNotIn("removed=", dis)
 
+    def test_surface_envelope(self):
+        chat = dict(self.CHAT, source="client", surface="gtnhplanner", requestId="r1",
+                    context={"planName": "Ti <line>"}, attachment={"id": "secret-plan"})
+        env = envelope.build("t-1", chat, "p", "2.9.0", surface={"name": "gtnhplanner", "request": "r1",
+                                                                 "attachment": 1234})
+        self.assertIn('<surface name="gtnhplanner" request="r1" attachment="1234">', env)
+        self.assertIn("Ti &lt;line&gt;", env)
+        self.assertNotIn("secret-plan", env)          # the attachment never enters the prompt
+        self.assertNotIn("<context", env)
+        plain = envelope.build("t-2", dict(self.CHAT), "p", "2.9.0")
+        self.assertNotIn("<surface", plain)
+
+    def test_split_data(self):
+        self.assertEqual(envelope.split_data("hi"), ("hi", None, None))
+        md, data, problem = envelope.split_data('Use this\n<data>{"proposalId": "p1"}</data>')
+        self.assertEqual((md, data, problem), ("Use this", {"proposalId": "p1"}, None))
+        md, data, problem = envelope.split_data('x <data>\n```json\n{"a": 1}\n```\n</data>')
+        self.assertEqual((md, data), ("x", {"a": 1}))
+        md, data, problem = envelope.split_data("x <data>[1]</data>")
+        self.assertEqual((md, data), ("x", None))
+        self.assertIn("JSON object", problem)
+        md, data, problem = envelope.split_data("x <data>{oops</data>")
+        self.assertIsNone(data)
+        self.assertIn("not valid JSON", problem)
+
     def test_parse_reply(self):
         p = envelope.parse_reply
         self.assertEqual(p("@reply\nHi {item:minecraft:stone}"), ("reply", "Hi {item:minecraft:stone}", True))
@@ -576,6 +601,91 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("Alex", "hook h3 fired, Alex"), self.bridge.says())
         self.assertEqual(self.daemon.events_dropped, 1)
 
+    SURF = {"source": "client", "surface": "gtnhplanner", "hasClientMod": True}
+
+    def surface_says(self, rid=None):
+        return [r for r in self.bridge.of("say") if r.get("surface") and (rid is None or r.get("requestId") == rid)]
+
+    async def test_surface_reply_is_private_with_data_and_attachment_stash(self):
+        await self.start()
+        await self.bridge.chat("Alex", "DATA please", requestId="r1", context={"planName": "Ti"},
+                               attachment={"id": "plan-1", "cards": [{"recipe": "x"}]}, **self.SURF)
+        await until(lambda: self.surface_says("r1"))
+        say = self.surface_says("r1")[0]
+        self.assertEqual((say["target"], say["surface"], say["final"]), ("Alex", "gtnhplanner", True))
+        self.assertEqual(say["markup"], "Try the Haber line, Alex")
+        self.assertEqual(say["data"]["proposalId"], "p1")
+        self.assertFalse([r for r in self.bridge.of("say") if r["target"] == "@a"], "never public")
+        thinking = self.bridge.of("thinking")[0]
+        self.assertEqual((thinking["surface"], thinking["requestId"]), ("gtnhplanner", "r1"))
+        env = self.envelopes()[0]
+        self.assertIn('<surface name="gtnhplanner" request="r1" attachment="', env)
+        self.assertNotIn("plan-1", env)
+        files = list((self.tmp / "run" / "surface").glob("t-*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(stat.S_IMODE(files[0].stat().st_mode), 0o600)
+        self.assertEqual(json.loads(files[0].read_text())["id"], "plan-1")
+        rows = [json.loads(line) for line in self.daemon.transcript.read_text().splitlines()]
+        self.assertEqual((rows[0]["surface"], rows[0]["requestId"]), ("gtnhplanner", "r1"))
+        self.assertNotIn("<recent>", "".join(self.daemon.recent))
+
+    async def test_surface_background_agent_interim_then_final(self):
+        await self.start()
+        await self.bridge.chat("Alex", "BG plan it", requestId="r2", **self.SURF)
+        await until(lambda: len(self.surface_says("r2")) == 2)
+        first, second = self.surface_says("r2")
+        self.assertEqual((first["final"], second["final"]), (False, True))
+        self.assertIn("Planner says", second["markup"])
+        self.assertFalse([r for r in self.bridge.of("say") if r["target"] == "@a"])
+
+    async def test_surface_error_and_whisper_directive_stay_on_the_panel(self):
+        await self.start()
+        await self.bridge.chat("Alex", "ERROR now", requestId="r3", **self.SURF)
+        await until(lambda: self.surface_says("r3"))
+        say = self.surface_says("r3")[0]
+        self.assertEqual((say["final"], say["error"]), (True, main.NOTICE_LIMIT))
+        await asyncio.sleep(0.3)
+        await self.bridge.chat("Alex", "NONE needed", requestId="r4", **self.SURF)
+        await until(lambda: self.surface_says("r4"))
+        say = self.surface_says("r4")[0]               # @none still ends the request
+        self.assertEqual((say["final"], say.get("markup"), say["data"]), (True, None, {}))
+        self.assertEqual(len(self.surface_says("r3")), 1, "one final per request")
+
+    async def test_surface_cancel_drops_a_queued_ask(self):
+        await self.start()
+        await self.bridge.chat("Bob", "PAUSE first")
+        await until(lambda: self.daemon.in_flight is not None)
+        await self.bridge.chat("Alex", "hello", requestId="r5", uid="00000000-0000-0000-0000-0000000000a1",
+                               **self.SURF)
+        await until(lambda: len(self.daemon.queue) == 1)
+        await self.bridge.send_raw(json.dumps({"type": "ask_cancel", "requestId": "r5", "player": "Alex",
+                                               "playerUuid": "00000000-0000-0000-0000-0000000000a1"}))
+        await until(lambda: not self.daemon.queue)
+        await until(lambda: len(self.bridge.of("say")) == 1)
+        await asyncio.sleep(0.5)
+        self.assertFalse(self.surface_says("r5"))
+        self.assertEqual(len(self.envelopes()), 1)
+
+    async def test_surface_cancel_of_a_running_ask_sends_nothing_more(self):
+        await self.start()
+        await self.bridge.chat("Alex", "PAUSE think", requestId="r6", uid="00000000-0000-0000-0000-0000000000a1",
+                               **self.SURF)
+        await until(lambda: self.daemon.in_flight is not None)
+        await self.bridge.send_raw(json.dumps({"type": "ask_cancel", "requestId": "r6", "player": "Alex",
+                                               "playerUuid": "00000000-0000-0000-0000-0000000000a1"}))
+        await until(lambda: self.daemon.in_flight is None, timeout=5)
+        await asyncio.sleep(0.3)
+        self.assertFalse(self.surface_says("r6"))
+        rows = [json.loads(line) for line in self.daemon.transcript.read_text().splitlines()]
+        self.assertEqual(rows[0]["requestId"], "r6")    # the turn still ran and was logged
+
+    async def test_surface_busy_notice_is_a_surface_error(self):
+        await self.start()
+        self.daemon.max_queue = 0
+        await self.bridge.chat("Alex", "hello", requestId="r7", **self.SURF)
+        await until(lambda: self.surface_says("r7"))
+        self.assertEqual(self.surface_says("r7")[0]["error"], main.NOTICE_BUSY)
+
     async def test_reconnect(self):
         await self.start()
         first = self.bridge.ws
@@ -741,6 +851,57 @@ class BridgeToolTests(DaemonTests.__bases__[0]):
         self.assertEqual(self.bridge.of("eval")[-1]["snapshot"], region)
         self.daemon.in_flight = None
         self.assertIn("asking player", (await self.call("undo"))["error"])
+
+    def surface_turn(self, name, rid="r1"):
+        turn = main.Turn({"player": name, "playerUuid": "00000000-0000-0000-0000-0000000000aa",
+                          "surface": "gtnhplanner", "requestId": rid})
+        self.daemon.in_flight = turn
+        return turn
+
+    async def test_say_during_a_surface_turn_goes_to_the_panel(self):
+        await self.start()
+        self.surface_turn("Alex")
+        data = {"proposalId": "p9", "recipes": [{"recipeId": "r-1", "label": "Ammonia", "tier": "HV"}]}
+        reply = await self.call("say", markup="Working on it...", data=data)
+        self.assertTrue(reply["ok"], reply)
+        sent = self.bridge.of("say")[-1]
+        self.assertEqual((sent["target"], sent["surface"], sent["requestId"], sent["final"]),
+                         ("Alex", "gtnhplanner", "r1", False))
+        self.assertEqual(sent["data"], data)
+        reply = await self.call("say", data={"note": "only data"}, target="@a")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.bridge.of("say")[-1]["target"], "Alex")
+        reply = await self.call("say", data=[1])
+        self.assertFalse(reply["ok"])
+        self.asking("Alex")                            # not a surface turn: data has nowhere to go
+        reply = await self.call("say", markup="hi", data={"note": "x"})
+        self.assertTrue(reply["ok"], reply)
+        self.assertIn("dropped", reply["result"]["note"])
+        self.assertNotIn("data", self.bridge.of("say")[-1])
+        self.assertEqual(self.bridge.of("say")[-1]["target"], "@a")
+
+    async def test_surface_attachment_lookup(self):
+        await self.start()
+        reply = await self.call("surface_attachment")
+        self.assertFalse(reply["ok"])                  # no turn running
+        turn = self.surface_turn("Alex")
+        reply = await self.call("surface_attachment")
+        self.assertFalse(reply["ok"])                  # nothing attached
+        self.assertIsNone(self.daemon.stash_attachment(turn, {"id": "plan-1"}))
+        reply = await self.call("surface_attachment")
+        self.assertTrue(reply["ok"], reply)
+        r = reply["result"]
+        self.assertEqual((r["turn"], r["surface"], r["requestId"]), (turn.id, "gtnhplanner", "r1"))
+        self.assertEqual(json.loads(Path(r["path"]).read_text()), {"id": "plan-1"})
+        later = self.surface_turn("Alex", rid="r2")    # a follow-up ask without an attachment: the newest one
+        later.key = turn.key
+        reply = await self.call("surface_attachment")
+        self.assertTrue(reply["result"]["earlier"])
+        self.daemon.in_flight = None
+        reply = await self.call("surface_attachment", turn=turn.id)
+        self.assertEqual(reply["result"]["path"], r["path"])
+        self.assertFalse((await self.call("surface_attachment", turn="../../etc"))["ok"])
+        self.assertIn("too large", self.daemon.stash_attachment(turn, {"x": "y" * (300 * 1024)}))
 
     async def test_old_bridge_and_no_bridge(self):
         self.bridge.accepts = ["list_players", "ping", "say", "thinking"]

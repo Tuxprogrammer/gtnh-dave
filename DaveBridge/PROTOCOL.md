@@ -81,7 +81,9 @@ A player addressed Dave (or `forwardAllChat` is on).
 | `triggered` | The message addresses Dave (see below), or came from the client half's Ask or `/dave ask`. |
 | `prompt` | Only when triggered: the question without Dave's name (and the `,`/`:` after a leading prefix). When nothing but the name is left (`thanks dave`, `dave?`), the whole message. |
 | `source` | `"chat"` for normal chat. `"client"` for an Ask from the client half (section 2). `"console"` for the `/dave ask` test hook (section 5). |
-| `context` | Only for `source:"client"`: what the player was looking at and holding (see `Ask`). **Client-reported and untrusted.** |
+| `context` | Only for `source:"client"`: what the player was looking at and holding (see `Ask`). **Client-reported and untrusted.** For a surface ask: the panel's own context object. |
+| `surface`, `requestId` | Only for a **surface ask** (section 2.7): another mod's panel asked through the client API. Answer with `say` carrying the same `surface` and `requestId` (section 1.4); replies then go only to that panel. A surface ask is **not** shown in chat. |
+| `attachment` | Surface asks only, optional: a JSON object or array (at most 256 KiB) from the panel, e.g. a plan snapshot. **Client-reported and untrusted.** |
 
 Chat is triggered when it addresses Dave, matched case-insensitively against `triggerPrefixes`: the message starts
 with a prefix, starts with a greeting and then a prefix (`hey dave, ...`; greetings `hey`, `hi`, `hello`, `hiya`,
@@ -94,6 +96,18 @@ privately (`target` = the player) when asked.
 
 If no agent is connected, a triggered sender gets a private "Dave is not connected right now." notice
 (`notifyWhenOffline`).
+
+#### `ask_cancel`
+
+The player gave up on a surface ask (section 2.7). Drop it if it has not started; send nothing more for it if it has.
+
+```json
+{"type":"ask_cancel","ts":...,"requestId":"r3f9c0d2a7b1e4c55","player":"Steve","playerUuid":"...",
+ "dim":0,"x":...,"y":...,"z":...,"hasClientMod":true}
+```
+
+Only from players whose client half said hello; `requestId` is validated (section 2.7) but not checked against
+asks the server relayed, so the agent matches it together with `playerUuid`.
 
 #### `player_join` / `player_leave`
 
@@ -160,7 +174,31 @@ on a later server tick, not immediately.
 | `target` | no (default `@a`) | `"@a"` (or `""`) for everyone, or a player name (case-insensitive). A named player gets a **whisper**. |
 | `replyTo` | no | The `id` of the `chat` event being answered (logged). |
 
-Exactly one of `markup`, `text` and `components` must be present (`bad_request` otherwise).
+Exactly one of `markup`, `text` and `components` must be present (`bad_request` otherwise), except for a surface
+reply (below).
+
+**Surface replies** (after 0.3.0; answers to a surface ask, section 2.7). Extra fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `surface`, `requestId` | both | From the `chat` event being answered. Names (`[a-z0-9][a-z0-9_.-]{0,31}`) and ids (`[A-Za-z0-9][A-Za-z0-9_-]{0,63}`) are validated. |
+| `final` | no (default `true`) | `false` for an interim reply (progress); the last reply for the request sets `true`. Send exactly one final reply or error per request. |
+| `data` | no | A JSON object (at most 64 KiB) passed to the panel verbatim. A reply may carry only `data` (no text). |
+| `error` | instead of a reply | Ends the request with an error the panel shows (`final` is forced on). |
+
+```json
+{"type":"say","target":"Steve","surface":"gtnhplanner","requestId":"r3f9c0d2a7b1e4c55","final":true,
+ "markup":"Use the {item:gregtech:gt.metaitem.01:...|Haber line}; Apply adds it.",
+ "data":{"proposalId":"p1","recipes":[{"recipeId":"gt.chemical.ammonia","label":"Ammonia","machine":"Large Chemical Reactor","tier":"HV"}]},
+ "reqId":9}
+```
+
+A surface reply is **never public chat**: `target` must name one player (`@a` or empty is `bad_request`). If that
+player's client half reported the `surface` capability, they get one `dave_message` packet (section 2.3) with the
+rendered lines, the markup and `data`, and no chat line; their reply sound plays on the final reply. Otherwise they
+get an ordinary whisper (or a gray notice for `error`); `data` is lost, and the ack warns
+`player 'X' has no client that shows <surface> replies; sent as a whisper`. An offline target gets nothing, with a
+warning. `error` and `data` without `surface` are `bad_request`.
 
 Every message is delivered as ordinary chat lines, rendered **per recipient** (section 1.6):
 - Public messages start each line with `<Dave> ` (name in `botNameColor`).
@@ -206,7 +244,9 @@ Reply (only when `reqId` was given):
 ```
 
 Shows a short gray italic "Dave is thinking..." line. With the client half the line replaces any earlier
-thinking line and disappears when the answer arrives (or after 60 s). Reply: `ack` (with `recipients`, 0 when the
+thinking line and disappears when the answer arrives (or after 60 s). With `surface` and `requestId` (a surface
+ask) it goes only to that player's panel as a `thinking` packet, never chat; players without a surface-capable
+client get nothing. Reply: `ack` (with `recipients`, 0 when the
 player is not online) / `error` as for `say`.
 
 #### `list_players`
@@ -797,8 +837,8 @@ Frame layout: `byte version (1)`, `utf8 kind`, `varint streamId`, `varint index`
 `varint length`, `length bytes`. The receiver reassembles a stream when all `total` chunks have arrived (in any
 order), then decodes the JSON as the packet class registered for `kind`.
 
-Limits on the receiving side (clients are untrusted): a reassembled client packet is at most 256 KiB (so at
-most 9 chunks may be announced), a client may have 4 streams open at once and an unfinished stream expires
+Limits on the receiving side (clients are untrusted): a reassembled client packet is at most 320 KiB (a
+256 KiB surface attachment plus question and context; so at most 11 chunks may be announced), a client may have 4 streams open at once and an unfinished stream expires
 after 30 s. On the client, server packets are capped at 8 MiB, with 8 open streams and a 60 s expiry. Either side
 drops a frame whose version is not 1, whose `kind` is longer than 64 characters or whose `length` is over 30000.
 Malformed frames, unknown kinds and kinds sent in the wrong direction are logged and dropped, never kick or crash
@@ -821,13 +861,14 @@ The client says hello again on every new connection. The server forgets a player
 
 | Kind | Direction | Fields |
 |---|---|---|
-| `client_hello` | C->S | `modVersion`, `protocol`, `capabilities` (string[]: `render`, `ask`, `context`, `lesson` (plays lessons, section 2.6), `eval` (can run `client_eval_request`), and `nei` when NEI is installed), `clientEvalAllowed` (bool) |
-| `ask` | C->S | `text` (string), `context` (object) |
+| `client_hello` | C->S | `modVersion`, `protocol`, `capabilities` (string[]: `render`, `ask`, `context`, `lesson` (plays lessons, section 2.6), `eval` (can run `client_eval_request`), `surface` (shows surface replies in panels, section 2.7), and `nei` when NEI is installed), `clientEvalAllowed` (bool) |
+| `ask` | C->S | `text` (string), `context` (object); for a surface ask also `surface`, `requestId`, `attachment` (object or array, at most 256 KiB) (section 2.7) |
+| `ask_cancel` | C->S | `requestId`: stop a surface ask (section 2.7) |
 | `client_settings` | C->S | `clientEvalAllowed` (bool): the player changed their opt-in mid-session |
 | `client_eval_result` | C->S | `id`, `ok`, `result` (any JSON), `error`, `errorType`, `output`, `ms`, `truncated`: the outcome of a `client_eval_request` (section 1.8). Results the server did not ask for are dropped. |
-| `server_hello` | S->C | `modVersion`, `protocol`, `botName`, `triggerPrefixes` (string[]), `maxAskLength` (int; 0 or missing from older servers) |
-| `dave_message` | S->C | **Unused since rich chat.** `botName`, `text`, `replyTo`. Dave's replies now arrive as normal chat for everyone; clients still render it if received. |
-| `thinking` | S->C | `botName`, `clear` (bool): show the indicator, or remove it because the answer arrived |
+| `server_hello` | S->C | `modVersion`, `protocol`, `botName`, `triggerPrefixes` (string[]), `maxAskLength` (int; 0 or missing from older servers), `features` (string[]; `surface` when the server accepts surface asks; missing from older servers) |
+| `dave_message` | S->C | Surface replies (section 2.7): `botName`, `surface`, `requestId`, `final` (bool), `text` (plain text of the lines), `markup` (when the agent sent markup), `components` (string[]: one vanilla chat-component JSON per line, rendered for this player), `data` (object or absent), `error` (instead of a reply). Without `surface` (unused since rich chat): `botName`, `text`, `replyTo`, rendered into chat. |
+| `thinking` | S->C | `botName`, `clear` (bool): show the indicator, or remove it because the answer arrived. With `surface` and `requestId`: the indicator for a surface ask, routed to its panel |
 | `client_eval_request` | S->C | `id` (server-chosen, `ce<n>`; the result must echo it), `script`, `mode` (`"groovy"`), `timeoutMs` (10..60000; the client uses at most 2000, and 500 for 0), `params` (JSON object or null). Sent only to players whose client reported `clientEvalAllowed` and the `eval` capability; the client re-checks its own opt-in before running it (section 1.8). |
 | `lesson` | S->C | A validated lesson (section 2.6): `id`, `title`, `loop`, `speed`, `dim`, `anchor` (x,y,z), `start` (x,y,z), `steps` |
 | `lesson_stop` | S->C | `id` (null or empty: whatever is playing) |
@@ -901,6 +942,61 @@ for another dimension, is answered with `lesson_status` `rejected`.
 The ghost Dave is a client-only object, never an entity in the world: nothing is synced and no other player can see
 it. Labels, the HUD bar (`Title · Step 3/7 · [K] stop`) and the chat line with `[Pause]` / `[Stop]` buttons come from
 the client's lang file, never from the server.
+
+### 2.7 Surface asks: the client API for other mods
+
+Another client mod (a "surface": a panel such as the GTNH Planner's) can ask Dave and get the answers back
+privately, outside chat, through `com.tuxprogrammer.davebridge.api.DaveBridgeClientApi`. Every method takes and
+returns strings only, so a mod can call it by reflection without compiling against DaveBridge:
+
+```java
+public static boolean available();
+public static String  ask(String surface, String text, String contextJson, String attachmentJson); // -> requestId
+public static void    cancel(String requestId);
+public static void    listen(String surface, java.util.function.Consumer<String> eventJson);
+public static void    unlisten(String surface, java.util.function.Consumer<String> eventJson);
+```
+
+- `available()`: connected to a server whose `server_hello` lists the `surface` feature. False on a dedicated
+  server, in the main menu, and on servers without DaveBridge or with an older one. Show an Ask button only then.
+- `ask(...)`: `surface` matches `[a-z0-9][a-z0-9_.-]{0,31}`; `text` is 1..`maxAskLength` characters after trimming;
+  `contextJson` is a JSON object of at most 16 KiB (shown to Dave) or null; `attachmentJson` is a JSON object or
+  array of at most 256 KiB (handed to Dave's tools, never his prompt) or null. Throws `IllegalStateException` when
+  not `available()`, `IllegalArgumentException` for anything else wrong. Returns the request id (`r` + 16 hex digits).
+- `cancel(id)`: nothing more arrives for `id`; the server relays `ask_cancel` to the agent.
+- `listen(surface, consumer)`: events for that surface's requests arrive **on the client thread**, one JSON string
+  each. A listener that throws is logged and does not affect others. On a dedicated server every method except
+  `available()` throws `IllegalStateException`.
+
+Events:
+
+```json
+{"type":"thinking","surface":"gtnhplanner","requestId":"r3f9c0d2a7b1e4c55"}
+{"type":"reply","surface":"gtnhplanner","requestId":"r3f9c0d2a7b1e4c55","final":false,
+ "text":"Checking ammonia lines...","markup":"Checking ammonia lines...","componentsJson":["{\"text\":\"Checking ammonia lines...\"}"]}
+{"type":"reply","surface":"gtnhplanner","requestId":"r3f9c0d2a7b1e4c55","final":true,
+ "text":"Use the Haber line; Apply adds it.","markup":"Use the {item:...|Haber line}; Apply adds it.",
+ "componentsJson":["{\"text\":\"\",\"extra\":[...]}"],
+ "data":{"proposalId":"p1","recipes":[{"recipeId":"gt.chemical.ammonia","label":"Ammonia","machine":"Large Chemical Reactor","tier":"HV"}]}}
+{"type":"error","surface":"gtnhplanner","requestId":"r3f9c0d2a7b1e4c55","final":true,"message":"Dave is not connected right now."}
+```
+
+- `thinking`: any number, while Dave works (refreshed about every 45 s).
+- `reply`: one or more. `text` is the plain text (lines joined by `\n`); `markup` is present when Dave sent markup;
+  `componentsJson` holds one vanilla `IChatComponent` JSON string per line (`IChatComponent.Serializer`), already
+  rendered for this player (item hovers, NEI links), with no `<Dave>` prefix; `data` is present when Dave sent some.
+  A reply may have only `data` (empty `text` and `componentsJson`).
+- `error`: always final. Sources: the server refused the ask (empty, too long, bad attachment, "slow down"
+  cooldown, unknown surface), Dave is offline or busy, the turn timed out or failed, the client gave up after
+  30 minutes without a final event, or the connection closed ("Disconnected from the server.").
+- **Exactly one final event per request** (`reply` with `final:true`, or `error`); nothing arrives after it, and
+  nothing after `cancel`. Events for requests this client did not send, or already finished, are dropped.
+- Surface asks are never shown in chat, and their replies never go to chat (a client that predates surfaces
+  cannot send them). They share the per-player ask cooldown (`askCooldownMillis`) with the Ask key.
+
+Compatibility: all fields are optional additions, so `protocol` stays `1`. An older server never lists the
+`surface` feature, so clients never send it surface asks; an older client never reports the `surface` capability,
+so the server whispers surface replies to it instead.
 
 ---
 

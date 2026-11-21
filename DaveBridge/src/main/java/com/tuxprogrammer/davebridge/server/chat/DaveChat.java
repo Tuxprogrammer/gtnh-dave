@@ -255,9 +255,15 @@ public final class DaveChat {
                 rendered = renderer(true).render(markup);
                 warnings.addAll(rendered.warnings);
                 message.markup = markup;
-            } else {
+            } else if (text != null) {
                 rendered = plain(text);
                 warnings.addAll(rendered.warnings);
+            } else { // data only
+                rendered = new MarkupRenderer.Rendered(
+                    new ArrayList<>(),
+                    new ArrayList<>(),
+                    new ArrayList<>(),
+                    new ArrayList<>());
             }
             if (rendered.vanillaLines.isEmpty() && data == null) {
                 throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "message is empty");

@@ -5,6 +5,9 @@ import re
 from datetime import datetime, timezone
 
 DIRECTIVES = {"@reply": "reply", "@whisper": "whisper", "@none": "none"}
+SURFACE_CONTEXT_CHARS = 4000
+DATA_RE = re.compile(r"<data>(.*?)</data>", re.S | re.I)
+MAX_DATA_BYTES = 64 * 1024
 
 
 def esc(value):
@@ -45,8 +48,13 @@ def context_attrs(ctx):
             ("holding", _item_id(held)), ("holding_name", held.get("name")), ("biome", ctx.get("biome"))]
 
 
-def build(turn_id, chat, profile, pack, client_eval=None, warnings=None, recent=None, kind="question", now=None):
-    """The <turn> envelope for one chat event (DaveBridge `chat`, PROTOCOL.md 1.3)."""
+def build(turn_id, chat, profile, pack, client_eval=None, warnings=None, recent=None, kind="question", now=None,
+          surface=None):
+    """The <turn> envelope for one chat event (DaveBridge `chat`, PROTOCOL.md 1.3).
+
+    `surface` ({"name", "request", "attachment"?: bytes}) marks an ask from another mod's panel: the envelope gets a
+    <surface> element whose body is the panel's context JSON (client-reported, escaped, capped). The attachment
+    itself never goes into the envelope; only its size, so Dave knows a tool can read it."""
     ts = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
     pos = None
     if all(isinstance(chat.get(k), (int, float)) for k in ("x", "y", "z")):
@@ -57,7 +65,14 @@ def build(turn_id, chat, profile, pack, client_eval=None, warnings=None, recent=
     lines = ['<turn%s>' % _attrs([("id", turn_id), ("ts", ts), ("pack", pack), ("kind", kind)]),
              "<player%s/>" % _attrs(player),
              "<profile>\n%s\n</profile>" % esc(profile or "no profile yet")]
-    if chat.get("source") == "client" and chat.get("context"):
+    if surface:
+        attrs = _attrs([("name", surface.get("name")), ("request", surface.get("request")),
+                        ("attachment", surface.get("attachment"))])
+        ctx = chat.get("context")
+        body = json.dumps(ctx, ensure_ascii=False, separators=(",", ":"))[:SURFACE_CONTEXT_CHARS] \
+            if isinstance(ctx, dict) and ctx else ""
+        lines.append("<surface%s>%s</surface>" % (attrs, esc(body)) if body else "<surface%s/>" % attrs)
+    elif chat.get("source") == "client" and chat.get("context"):
         lines.append("<context%s/>" % _attrs(context_attrs(chat["context"])))
     for reply_to, text in warnings or []:
         lines.append('<warnings reply="%s">%s</warnings>' % (esc(reply_to), esc(text)))
@@ -131,3 +146,27 @@ def parse_reply(text, default="reply"):
     if m:                                   # "@reply Hello" on one line: tolerate it
         return DIRECTIVES[m.group(1).lower()], (m.group(2) + ("\n" + rest if rest else "")).strip(), True
     return default, text.strip(), False
+
+
+def split_data(markup):
+    """Takes a <data>{...}</data> block out of a surface reply: returns (markup without it, data dict or None,
+    problem text or None). Only the last block counts; a block that is not a JSON object, or over 64 KiB, is
+    dropped with a problem (told to Dave as a warning next turn)."""
+    if not markup:
+        return markup, None, None
+    blocks = DATA_RE.findall(markup)
+    if not blocks:
+        return markup, None, None
+    rest = DATA_RE.sub("", markup).strip("\n").strip()
+    raw = blocks[-1].strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\s*|\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        return rest, None, "<data> was not valid JSON (%s); the reply went without it" % e
+    if not isinstance(data, dict):
+        return rest, None, "<data> must be a JSON object; the reply went without it"
+    if len(json.dumps(data, separators=(",", ":")).encode("utf-8")) > MAX_DATA_BYTES:
+        return rest, None, "<data> is over 64 KiB; the reply went without it"
+    return rest, data, None

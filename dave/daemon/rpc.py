@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from dave.bridge.queries import QueryError, Queries
@@ -23,6 +24,8 @@ from dave.bridge.queries import QueryError, Queries
 log = logging.getLogger("dave")
 
 MAX_LINE = 1024 * 1024
+MAX_DATA_BYTES = 64 * 1024
+TURN_ID_RE = re.compile(r"^t-[0-9a-f]{10}$")
 NEEDS_030 = {"hook_add", "hook_list", "hook_remove", "snapshot_list", "snapshot_get", "undo"}
 
 
@@ -148,10 +151,9 @@ class BridgeRPC:
                 msg["player"] = player
             return await self.request(msg, timeout=30)
         if op == "say":
-            if not a.get("markup"):
-                raise RpcError("markup is required")
-            return await self.request({"type": "say", "target": a.get("target") or "@a", "markup": a["markup"]},
-                                      timeout=30)
+            return await self.say(a)
+        if op == "surface_attachment":
+            return self.surface_attachment(a)
         if op == "list_players":
             return await self.request({"type": "list_players"}, timeout=30)
         if op == "lesson":
@@ -225,6 +227,66 @@ class BridgeRPC:
                    "params": "params", "filter": "filter", "every_ticks": "everyTicks", "once": "once",
                    "cooldown_seconds": "cooldownSeconds", "edge": "edge",
                    "fire_if_true_at_start": "fireIfTrueAtStart", "expires_in_seconds": "expiresInSeconds"}
+
+    async def say(self, a):
+        """A mid-turn chat line. During a panel's ask (a surface turn) a say to the asker (or with no target, or @a)
+        goes privately to that panel as an interim reply (final false), with optional `data`; it is never public."""
+        data = a.get("data")
+        if data is not None and not isinstance(data, dict):
+            raise RpcError("data must be a JSON object")
+        if data is not None and len(json.dumps(data, separators=(",", ":")).encode("utf-8")) > MAX_DATA_BYTES:
+            raise RpcError("data is over 64 KiB")
+        markup = a.get("markup")
+        turn = self.daemon.in_flight
+        target = a.get("target") or "@a"
+        if turn is not None and turn.surface and target in ("@a", "", turn.player):
+            if turn.cancelled:
+                return {"ok": True, "recipients": 0, "note": "the player cancelled this ask; nothing was sent"}
+            if not markup and data is None:
+                raise RpcError("markup or data is required")
+            msg = {"type": "say", "target": turn.player, "surface": turn.surface, "requestId": turn.request_id,
+                   "final": False}
+            if markup:
+                msg["markup"] = markup
+            if data is not None:
+                msg["data"] = data
+            reply = await self.request(msg, timeout=30)
+            reply["note"] = "sent privately to %s's %s panel (interim)" % (turn.player, turn.surface)
+            return reply
+        if not markup:
+            raise RpcError("markup is required")
+        reply = await self.request({"type": "say", "target": target, "markup": markup}, timeout=30)
+        if data is not None:
+            reply["note"] = "data was dropped: it only reaches a panel, while answering that panel's ask"
+        return reply
+
+    def surface_attachment(self, a):
+        """Where a panel's attachment (a plan snapshot) is stashed. Default: the turn in flight's, else the asker's
+        newest; `turn` picks a turn id. Returns path (a 0600 JSON file), turn, surface, requestId and bytes."""
+        from dave.daemon.main import surface_dir   # late import: main imports this module
+        tid = a.get("turn")
+        if tid is not None:
+            if not isinstance(tid, str) or not TURN_ID_RE.match(tid):
+                raise RpcError("turn must be a turn id like t-0123456789")
+            path = surface_dir(self.daemon.cfg) / (tid + ".json")
+            found = next((v for v in self.daemon.attachments.values() if v[0] == tid), None)
+            meta = {"turn": tid, "surface": found[1] if found else None, "requestId": found[2] if found else None}
+        else:
+            turn = self.daemon.in_flight
+            if turn is None:
+                raise RpcError("no turn is running; pass turn")
+            if turn.attachment:
+                path, meta = turn.attachment, {"turn": turn.id, "surface": turn.surface, "requestId": turn.request_id}
+            elif turn.key in self.daemon.attachments:
+                tid, surface, rid, path = self.daemon.attachments[turn.key]
+                meta = {"turn": tid, "surface": surface, "requestId": rid, "earlier": True}
+            else:
+                raise RpcError("%s has not attached anything" % turn.player)
+        try:
+            size = os.stat(path).st_size
+        except OSError:
+            raise RpcError("that attachment is gone (only the newest 50 are kept)")
+        return dict(meta, path=str(path), bytes=size)
 
     async def hook_add(self, a):
         """The owner defaults to the asker: the player the hook reports back to."""

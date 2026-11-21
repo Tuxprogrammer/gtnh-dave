@@ -142,13 +142,42 @@ TOOLS = [
         "description": (
             "Post a chat line now, mid-turn (progress on a long job: \"Scanning loaded chunks...\"). Your normal "
             "answer is the turn's final text, not this tool. markup is Dave markup; target @a (default) or a "
-            "player name (whisper)."
+            "player name (whisper). While answering a panel's ask (<surface> in the turn) it goes privately to "
+            "that panel as an interim reply instead, never to chat, and may carry data (or only data)."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"markup": {"type": "string"}, "target": {"type": "string", "default": "@a"}},
-            "required": ["markup"],
+            "properties": {
+                "markup": {"type": "string"},
+                "target": {"type": "string", "default": "@a"},
+                "data": {
+                    "type": "object",
+                    "description": (
+                        "Only while answering a panel's ask (<surface> in the turn): structured data for that panel, "
+                        "e.g. {\"proposalId\"?: \"...\", \"recipes\"?: [{\"recipeId\": \"...\", \"label\": \"...\", "
+                        "\"machine\"?: \"...\", \"tier\"?: \"HV\"}], \"note\"?: \"...\"}. Dropped otherwise."),
+                    "properties": {
+                        "proposalId": {"type": "string"},
+                        "recipes": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {"recipeId": {"type": "string"}, "label": {"type": "string"},
+                                           "machine": {"type": "string"}, "tier": {"type": "string"}},
+                            "required": ["recipeId", "label"]}},
+                        "note": {"type": "string"},
+                    },
+                },
+            },
         },
+    },
+    {
+        "name": "surface_attachment",
+        "description": (
+            "Where the attachment of a panel's ask is stored (e.g. the GTNH planner's plan snapshot): a JSON file "
+            "path for tools that import it. It is never in your prompt. Default: this turn's attachment, else the "
+            "asker's newest (\"earlier\": true). turn: a turn id to pick another. Returns path, turn, surface, "
+            "requestId, bytes."
+        ),
+        "inputSchema": {"type": "object", "properties": {"turn": {"type": "string"}}},
     },
     {
         "name": "lesson",
@@ -276,7 +305,7 @@ OPS = {"eval": "eval", "describe": "describe", "query_run": "query_run", "query_
        "query_get": "query_get", "query_save": "query_save", "say": "say", "list_players": "list_players",
        "lesson": "lesson", "lesson_stop": "lesson_stop", "hook_add": "hook_add", "hook_list": "hook_list",
        "hook_remove": "hook_remove", "snapshot_list": "snapshot_list", "snapshot_get": "snapshot_get",
-       "undo": "undo"}
+       "undo": "undo", "surface_attachment": "surface_attachment"}
 
 
 def log(msg):

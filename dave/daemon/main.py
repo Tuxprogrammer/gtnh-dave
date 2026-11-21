@@ -43,6 +43,14 @@ NOTICE_TIMEOUT = "Sorry, that one took me too long and I had to give up on it. T
 NOTICE_ERROR = "Sorry, something went wrong on my end. Try again in a bit."
 NOTICE_LIMIT = "I'm out of steam for now (usage limit). Try again later!"
 NOTICE_STALE = "Sorry, I lost the connection to the server and your question waited too long. Could you ask again?"
+NOTICE_NO_ANSWER = "Dave finished without an answer for this panel."
+NOTICE_LATE = "(a late part of my answer to your planner question)"
+
+SURFACE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+MAX_ATTACHMENT_BYTES = 256 * 1024
+MAX_DATA_BYTES = 64 * 1024
+ATTACHMENTS_KEPT = 50                    # newest surface attachment files kept in <run>/surface
 
 SESSION_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]{7,80}$")
 
@@ -192,11 +200,22 @@ class Bridge:
                 log.warning("bridge: server tick stuck at %s (queue depth %s)", tick, pong.get("queueDepth"))
             self._last_tick = tick
 
-    async def say(self, target, markup=None, text=None, reply_to=None):
+    async def say(self, target, markup=None, text=None, reply_to=None, surface=None, data=None, error=None):
+        """A chat message, or with `surface` = (name, requestId, final) a private reply to that panel (PROTOCOL.md
+        1.4): markup/text, optional `data` (a dict), or `error` instead of a reply."""
         msg = {"type": "say", "target": target}
-        msg.update({"markup": markup} if markup is not None else {"text": text})
+        if error is not None:
+            msg["error"] = error
+        elif markup is not None:
+            msg["markup"] = markup
+        elif text is not None:
+            msg["text"] = text
         if reply_to:
             msg["replyTo"] = reply_to
+        if surface:
+            msg.update(surface=surface[0], requestId=surface[1], final=bool(surface[2]))
+            if data is not None:
+                msg["data"] = data
         return await self.request(msg)
 
     async def notice(self, player, text):
@@ -221,9 +240,12 @@ class Bridge:
             msg["id"] = lesson_id
         return await self.request(msg, timeout)
 
-    async def thinking(self, player):
+    async def thinking(self, player, surface=None, request_id=None):
+        msg = {"type": "thinking", "target": player}
+        if surface and request_id:
+            msg.update(surface=surface, requestId=request_id)
         try:
-            await self.request({"type": "thinking", "target": player}, timeout=10)
+            await self.request(msg, timeout=10)
         except (BridgeDown, asyncio.TimeoutError):
             pass
 
@@ -436,6 +458,13 @@ class Turn:
         self.key = ("event:" + str(event.get("hookId"))) if event else (self.uuid or "name:" + self.player.lower())
         self.enqueued = time.monotonic()
         self.id = "t-" + uuidlib.uuid4().hex[:10]
+        # A surface ask (another mod's panel, PROTOCOL.md 2.7): every reply goes privately to that panel.
+        surface, rid = chat.get("surface"), chat.get("requestId")
+        ok = isinstance(surface, str) and SURFACE_RE.match(surface) and isinstance(rid, str) and REQUEST_ID_RE.match(rid)
+        self.surface, self.request_id = (surface, rid) if ok and event is None else (None, None)
+        self.attachment = None                 # Path of the stashed attachment (stash_attachment)
+        self.cancelled = False                 # the player cancelled: send nothing more for this turn
+        self.final_sent = False                # a surface turn's final reply (or error) went out
 
     @classmethod
     def for_event(cls, ev):
@@ -478,6 +507,7 @@ class Daemon:
         self.events_dropped = 0                # dropped since the last accepted event turn (told to Dave then)
         self.fresh_session = True              # next turn is the first of a session: add <recent>
         self.last_turn = None                  # the turn a late (background) result belongs to
+        self.attachments = {}                  # player key -> (turn id, surface, requestId, path) of their newest
         logs = log_dir(cfg)
         logs.mkdir(parents=True, exist_ok=True)
         self.transcript = logs / "turns.jsonl"
@@ -512,6 +542,22 @@ class Daemon:
                      ev.get("confirmId"))
         elif t in ("hook_fired", "hook_disabled"):
             self.on_hook(ev)
+        elif t == "ask_cancel":
+            self.on_cancel(ev)
+
+    def on_cancel(self, ev):
+        """The player cancelled a surface ask: drop it if queued; if it is running, send nothing more for it (the
+        turn itself runs to its end: claude has no clean per-turn interrupt in stream-json mode)."""
+        rid, who = ev.get("requestId"), ev.get("playerUuid") or ""
+        mine = lambda q: q.request_id == rid and (q.uuid == who or not who)  # noqa: E731
+        for q in list(self.queue):
+            if mine(q):
+                self.queue.remove(q)
+                log.info("cancelled queued surface ask %s from %s", rid, q.player)
+                return
+        if self.in_flight and mine(self.in_flight):
+            self.in_flight.cancelled = True
+            log.info("cancelled running surface ask %s from %s; its replies are dropped", rid, self.in_flight.player)
 
     def on_hook(self, ev):
         """A hook fired (or was disabled): queue an event turn for Dave, coalesced and rate-limited.
@@ -554,17 +600,47 @@ class Daemon:
         mine = sum(1 for q in self.queue if q.key == key) + (1 if self.in_flight and self.in_flight.key == key else 0)
         now = time.monotonic()
         if mine >= self.max_per_player or (mine and now - self.last_ask.get(key, 0) < self.cooldown):
-            await self.bridge.notice(name, NOTICE_ONE_AT_A_TIME)
+            await self.tell(turn, NOTICE_ONE_AT_A_TIME)
             return
         if len(self.queue) >= self.max_queue:
-            await self.bridge.notice(name, NOTICE_BUSY)
+            await self.tell(turn, NOTICE_BUSY)
             return
+        if turn.surface and ev.get("attachment") is not None:
+            problem = self.stash_attachment(turn, ev["attachment"])
+            if problem:
+                await self.tell(turn, problem)
+                return
         if len(self.last_ask) > 500:           # forget players who have not asked for a while
             self.last_ask = {k: v for k, v in self.last_ask.items() if now - v < 3600}
         self.last_ask[key] = now
         self.queue.append(turn)
         self.wakeup.set()
-        await self.bridge.thinking(name)
+        await self.bridge.thinking(name, turn.surface, turn.request_id)
+
+    def stash_attachment(self, turn, attachment):
+        """Writes a surface ask's attachment to <run>/surface/<turn id>.json (0600) for tools to read
+        (rpc `surface_attachment`); it never goes into Dave's prompt. Returns an error text, or None."""
+        if not isinstance(attachment, (dict, list)):
+            return "The attachment must be a JSON object or array."
+        raw = json.dumps(attachment, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > MAX_ATTACHMENT_BYTES:
+            return "The attachment is too large."
+        d = surface_dir(self.cfg)
+        try:
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = d / (turn.id + ".json")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            old = sorted(d.glob("t-*.json"), key=lambda p: p.stat().st_mtime)
+            for p in old[:-ATTACHMENTS_KEPT]:
+                p.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("could not stash the attachment for %s: %s", turn.id, e)
+            return "Dave could not store the attachment."
+        turn.attachment = path
+        self.attachments[turn.key] = (turn.id, turn.surface, turn.request_id, path)
+        return None
 
     async def on_late_result(self, ev):
         """A top-level result with no turn waiting for it (an unannounced second answer, between turns)."""
@@ -591,7 +667,7 @@ class Daemon:
                     continue
             elif waited > self.stale:
                 log.info("dropping stale question from %s (waited %.0f s for the bridge)", turn.player, waited)
-                await self.bridge.notice(turn.player, NOTICE_STALE)
+                await self.tell(turn, NOTICE_STALE)
                 continue
             self.in_flight = turn
             try:
@@ -602,13 +678,24 @@ class Daemon:
             finally:
                 self.in_flight = None
                 self.free_since = time.monotonic()
+            if turn.surface and not turn.final_sent and not turn.cancelled:
+                await self.tell(turn, NOTICE_NO_ANSWER)    # every surface ask ends with a final event
 
     async def tell(self, turn, text):
-        """A failure notice to the asker. Event turns had no asker, so their failures are only logged."""
-        if turn.event is None:
-            await self.bridge.notice(turn.player, text)
-        else:
+        """A failure notice to the asker: a final surface error for a panel's ask, else a private chat line. Event
+        turns had no asker, so their failures are only logged."""
+        if turn.event is not None:
             log.warning("hook event turn %s failed: %s", turn.id, text)
+        elif turn.surface:
+            if turn.cancelled or turn.final_sent:
+                return
+            turn.final_sent = True
+            try:
+                await self.bridge.say(turn.player, error=text, surface=(turn.surface, turn.request_id, True))
+            except (BridgeDown, asyncio.TimeoutError):
+                pass
+        else:
+            await self.bridge.notice(turn.player, text)
 
     def next_turn(self):
         """The oldest player question, else the oldest event turn: a hook never makes a player wait."""
@@ -645,7 +732,8 @@ class Daemon:
                                      dropped=turn.dropped)
         else:
             content = envelope.build(turn.id, chat, profile, self.pack, client_eval=self.client_eval.get(turn.uuid),
-                                     warnings=self.warnings, recent=list(self.recent) if self.fresh_session else None)
+                                     warnings=self.warnings, recent=list(self.recent) if self.fresh_session else None,
+                                     surface=self.surface_info(turn))
         previous = self.last_turn
         self.warnings, self.fresh_session, self.last_turn = [], False, turn
         self.claude.busy = True
@@ -659,10 +747,23 @@ class Daemon:
                 await self.deliver(turn, extra, late=True)
             self.claude.busy = False
 
+    @staticmethod
+    def surface_info(turn):
+        """The envelope's <surface> attributes for a panel's ask, or None."""
+        if not turn.surface:
+            return None
+        info = {"name": turn.surface, "request": turn.request_id}
+        if turn.attachment:
+            try:
+                info["attachment"] = turn.attachment.stat().st_size
+            except OSError:
+                pass
+        return info
+
     async def _run_turn_owned(self, turn, content):
         # Nobody asked for an event turn, so nobody gets a thinking indicator.
         quiet = turn.event is not None
-        heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn.player))
+        heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn))
         started = time.monotonic()
         try:
             result = await self._ask_with_recovery(turn, content)
@@ -673,7 +774,7 @@ class Daemon:
         await self.deliver(turn, result, started=started)
         while self.claude.background > 0 and self.claude.alive:
             log.info("background agent running for %s; holding the queue for its follow-up", turn.player)
-            heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn.player))
+            heartbeat = asyncio.create_task(self._thinking_heartbeat(None if quiet else turn))
             try:
                 follow = await self.claude.wait_followup(self.followup_timeout)
             except (asyncio.TimeoutError, ClaudeDied) as e:
@@ -717,11 +818,11 @@ class Daemon:
                 await self.tell(turn, NOTICE_CRASH)
                 return None
 
-    async def _thinking_heartbeat(self, player):
+    async def _thinking_heartbeat(self, turn):
         while True:
             await asyncio.sleep(45)               # the client half drops the line after 60 s
-            if player:
-                await self.bridge.thinking(player)
+            if turn and not turn.cancelled:
+                await self.bridge.thinking(turn.player, turn.surface, turn.request_id)
 
     async def deliver(self, turn, result, started=None, late=False):
         text = result.get("result") or ""
@@ -734,6 +835,10 @@ class Daemon:
         directive, markup, had = envelope.parse_reply(text, self.default_target)
         if not had:
             log.info("turn %s: no directive on line 1; using %s", turn.id, self.default_target)
+        if turn.surface:
+            ack = await self.deliver_surface(turn, directive, markup, late)
+            self._record(turn, result, directive, markup, ack, started, late)
+            return
         ack = None
         if directive != "none" and markup:
             target = "@a" if directive == "reply" else turn.player
@@ -751,10 +856,49 @@ class Daemon:
                 self.recent.append("Dave: %s" % markup.replace("\n", " ")[:150])
         self._record(turn, result, directive, markup, ack, started, late)
 
+    async def deliver_surface(self, turn, directive, markup, late):
+        """Dave's answer to a panel's ask: always private, to that panel (never public chat, whatever the
+        directive). A <data>{...}</data> block becomes the reply's `data`. The answer is final unless a background
+        agent is still running (its follow-up is then the final one). After the final reply, a late extra answer
+        goes to the asker as a whisper, since the panel has stopped listening."""
+        if turn.cancelled:
+            log.info("turn %s was cancelled; dropping its reply", turn.id)
+            return None
+        markup, data, problem = envelope.split_data(markup)
+        if problem:
+            self.warnings.append((turn.id, problem))
+        if directive == "none" and data is None:
+            markup = None
+        if turn.final_sent:
+            if not markup:
+                return None
+            target, surface, data = turn.player, None, None
+            markup = NOTICE_LATE + "\n" + markup
+        else:
+            final = not (self.claude.busy and self.claude.background > 0)
+            target, surface = turn.player, (turn.surface, turn.request_id, final)
+            if not markup and data is None:
+                if not final:
+                    return None
+                data = {}                              # an empty final reply still ends the request
+            turn.final_sent = final
+        ack = None
+        try:
+            ack = await self.bridge.say(target, markup=markup or None, data=data, surface=surface,
+                                        reply_to=turn.chat.get("id"))
+        except (BridgeDown, asyncio.TimeoutError) as e:
+            log.warning("could not post the surface reply for %s: %s", turn.id, e)
+        if ack and ack.get("type") == "error":
+            log.warning("surface say refused for %s: %s %s", turn.id, ack.get("code"), ack.get("message"))
+        for w in (ack or {}).get("warnings") or []:
+            self.warnings.append((turn.id, w))
+        return ack
+
     def _record(self, turn, result, directive, reply, ack, started, late):
         row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "turn": turn.id, "player": turn.player, "uuid": turn.uuid,
                "source": turn.chat.get("source"), "prompt": turn.chat.get("prompt") or turn.chat.get("message"),
                "hook": turn.event.get("hookId") if turn.event else None,
+               "surface": turn.surface, "requestId": turn.request_id,
                "directive": directive, "reply": reply, "late": late,
                "seconds": round(time.monotonic() - started, 1) if started else None,
                "session": result.get("session_id"), "num_turns": result.get("num_turns"),
@@ -810,6 +954,11 @@ class Daemon:
 def queries_dir(cfg):
     """Saved eval queries: [paths] queries (DAVE_QUERIES_DIR), else <memory>/queries (the memory volume)."""
     return cfg["paths"].get("queries") or cfg["paths"]["memory"] / "queries"
+
+
+def surface_dir(cfg):
+    """Where surface ask attachments are stashed: <run>/surface (0700, files 0600)."""
+    return Path(cfg["paths"]["run"]) / "surface"
 
 
 def log_dir(cfg):

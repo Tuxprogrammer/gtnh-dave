@@ -10,8 +10,8 @@ A Forge mod for Minecraft 1.7.10 / GT New Horizons that connects the server to a
   hooks that tell the agent when something happens in the game, and guided demonstrations sent to the client half.
 - **Client half (optional on clients):** a thinking indicator, links that open NEI recipe/usage pages, an
   "Ask Dave" key that sends the question with what you are looking at and holding, guided demonstrations (a ghost
-  Dave only that player sees), and client eval relayed by the server for players who opt in (off by default).
-  Clients never talk to the agent; everything goes through the server. Players without the mod use Dave through plain chat.
+  Dave only that player sees), client eval relayed by the server for players who opt in (off by default), and a
+  client API other mods use to ask Dave from their own panels and get private answers (below). Clients never talk to the agent; everything goes through the server. Players without the mod use Dave through plain chat.
 
 One jar for both sides (`acceptableRemoteVersions = "*"`). Built for the GTNH 2.9.x dedicated server on modern
 Java (17+ via lwjgl3ify); the code also runs on Java 8.
@@ -20,6 +20,22 @@ See [PROTOCOL.md](PROTOCOL.md) for the WebSocket and packet protocol and every c
 [docs/dave-markup.md](docs/dave-markup.md) for the chat markup Dave writes (prompt-ready), and
 [docs/chat-integration.md](docs/chat-integration.md) for how it maps onto the pack's native chat features
 (BetterQuesting quest links, NEI bookmark links, GTNHLib item names, sharewhereiam waypoints).
+
+## Client API for other mods
+
+A client mod can put an "Ask Dave" box in its own screen. Call
+`com.tuxprogrammer.davebridge.api.DaveBridgeClientApi` (strings only, so reflection works without a compile
+dependency):
+
+```java
+if (DaveBridgeClientApi.available()) {
+    DaveBridgeClientApi.listen("mypanel", json -> panel.onDaveEvent(json));   // client thread
+    String id = DaveBridgeClientApi.ask("mypanel", "what feeds this line?", "{\"open\":\"plan-1\"}", planJson);
+}
+```
+
+Answers come back only to that player's panel as `thinking`, `reply` and `error` events (the last one has
+`final:true`), never in chat. Contract, limits and event JSON: [PROTOCOL.md](PROTOCOL.md) section 2.7.
 
 ## Install
 
@@ -38,6 +54,7 @@ port 25580, and pass the token to Dave's container as a secret. See "Docker depl
 | `com.tuxprogrammer.davebridge` | both | `@Mod` class |
 | `...common` | both | proxy base, server config, packet DTOs, packet channel and chunking, main-thread queue, Groovy script engine and SRG name mapping, lesson limits |
 | `...server` | both (logical server) | agent WebSocket, chat hooks, relay and markup, `/dave` command, eval, describe and confirms, event hooks (`hooks`), snapshots and undo (`undo`), client-eval relay, lessons, client-mod tracking, NEI/BQ/GTNHLib compat |
+| `...api` | both (works on the client) | `DaveBridgeClientApi`: surface asks for other mods (reaches the client half through `common.SurfaceHook`) |
 | `...client` | client only | `ClientProxy`, rendering, Ask key and chat line, context capture, client eval and opt-in, lesson playback (ghost Dave), client config and GUI |
 
 Nothing outside `client` references client classes; `SideSafetyTest` checks the compiled classes.
