@@ -283,10 +283,20 @@ class Errors(Base):
         self.assertEqual(self.call("recipes_search", text="dust")[0], '{"results":[]}')
 
     def test_request_over_64k_is_refused_locally(self):
-        text, err = self.call("plan_import", snapshot={"blob": "x" * (70 * 1024)})
+        text, err = self.call("plan_create", name="x" * (70 * 1024))
         self.assertTrue(err)
         self.assertIn("at most 65536", text)
         self.assertEqual(self.site.requests, [])
+
+    def test_import_takes_up_to_512k(self):
+        self.site.routes["plans/import"] = (200, {"planId": "x1"}, "application/json")
+        text, err = self.call("plan_import", snapshot={"blob": "x" * (300 * 1024)})
+        self.assertFalse(err, text)
+        self.assertEqual(len(self.site.requests), 1)
+        text, err = self.call("plan_import", snapshot={"blob": "x" * (520 * 1024)})
+        self.assertTrue(err)
+        self.assertIn("at most 524288", text)
+        self.assertEqual(len(self.site.requests), 1)
 
 
 class NotConfigured(Base):

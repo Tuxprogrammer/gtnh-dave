@@ -31,7 +31,8 @@ API_PATH = "/api/agent/v1/"
 TIMEOUT = 6                 # seconds, every endpoint ...
 SLOW = {"plans/solve": 10, "plans/expand-inputs": 10}    # ... except the solver's
 MAX_TEXT = 12000            # characters of response JSON handed to Dave
-MAX_BODY = 64 * 1024        # the API refuses request bodies over 64 KB
+MAX_BODY = 64 * 1024        # the API refuses request bodies over 64 KB ...
+MAX_BODY_BY_ENDPOINT = {"plans/import": 512 * 1024}  # ... except plans/import (a plan snapshot)
 DAEMON_TIMEOUT = 10
 
 INSTRUCTIONS = (
@@ -277,9 +278,10 @@ class Service:
     def post(self, endpoint, body):
         base, token = self.settings()
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(data) > MAX_BODY:
-            raise PlannerError("the request is %d bytes; the planner's agent API takes at most %d" % (
-                len(data), MAX_BODY))
+        limit = MAX_BODY_BY_ENDPOINT.get(endpoint, MAX_BODY)
+        if len(data) > limit:
+            raise PlannerError("the request is %d bytes; the planner's agent API takes at most %d here" % (
+                len(data), limit))
         req = urllib.request.Request(base + endpoint, data=data, method="POST", headers={
             "Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer " + token})
         timeout = SLOW.get(endpoint, TIMEOUT)

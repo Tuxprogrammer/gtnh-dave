@@ -35,7 +35,7 @@ otherwise says why it was left out.
 
 - Every call is a JSON `POST` with `Authorization: Bearer <token>`; redirects are not followed and no proxy is used
   (the API is for the internal network only). Timeouts: 10 s for `plans/solve` and `plans/expand-inputs`, 6 s for
-  the rest. Request bodies over 64 KB are refused before sending, as the site would.
+  the rest. Request bodies over 64 KB (512 KB for `plans/import`) are refused before sending, as the site would.
 - Arguments are passed through as the request body (null members dropped). The input schemas match the spec's
   request fields and refuse unknown ones, as the site does.
 - `plan_add_cards` takes cards as `{recipeId, machine?, tier?, dials?: {dialId: option key or number}}` and sends
