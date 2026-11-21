@@ -16,7 +16,6 @@ echoed. dave/launch/dave_cmd.py registers this server only when both are configu
 
 import json
 import os
-import re
 import socket
 import sys
 import threading
@@ -63,47 +62,17 @@ RESOURCE = {"description": "A resource: its planner id from resources_search (a 
 CONSTRAINTS = {
     "type": "object", "additionalProperties": False,
     "description": "tierCap and heat (K) filter recipes; banned takes ids or names (recipe, map, machine); free "
-                   "means 'treat as raw' when expanding and solving. cleanroom and lowgrav are not enforced by "
-                   "search (the answer lists them in notEnforced).",
+                   "means 'treat as raw' when expanding and solving; steam: true lets steam and primitive "
+                   "machines in (default: only when tierCap is ULV; steam isn't free, so leave it off past the steam "
+                   "age). cleanroom and lowgrav are not enforced by search (the answer lists them in notEnforced).",
     "properties": {"tierCap": TIER, "heat": {"type": "number"}, "cleanroom": {"type": "boolean"},
-                   "lowgrav": {"type": "boolean"}, "banned": {"type": "array", "items": {"type": "string"}},
+                   "lowgrav": {"type": "boolean"}, "steam": {"type": "boolean"},
+                   "banned": {"type": "array", "items": {"type": "string"}},
                    "free": {"type": "array", "items": {"type": "string"}}},
 }
 LIMIT = {"type": "integer", "minimum": 1, "maximum": 25, "default": 8}
 
-# Steam machines read as 0 EU to the site, so its rank and its default machine choice treat them as free, and their
-# dataset tiers (taken from the recipe's EU) don't let tierCap filter them. Until the site handles steam itself, these
-# tools ban every steam machine unless the plan is for a steam-age player. Handler ids from the planner dataset.
-STEAM_MACHINES = (
-    "steam-alloy-smelter", "steam-ammo-press", "steam-blender", "steam-compressor", "steam-extractor",
-    "steam-forge-hammer", "steam-furnace", "steam-fuser", "steam-grinder", "steam-hearth", "steam-macerator",
-    "steam-presser", "steam-purifier", "steam-separator", "steam-squasher",
-    "high-pressure-steam-alloy-smelter", "high-pressure-steam-compressor", "high-pressure-steam-extractor",
-    "high-pressure-steam-forge-hammer", "high-pressure-steam-furnace", "high-pressure-steam-macerator",
-)
-ALLOW_STEAM = {"type": "boolean", "description": (
-    "Allow steam machines (default: only when tierCap is ULV). Steam isn't free, so leave this off for any player "
-    "past the steam age; these tools then ban every steam machine.")}
-STEAM_TOOLS = ("plan_create", "recipes_search", "plan_expand_inputs")
 
-
-def apply_steam_rule(body, default=None):
-    """Strip the tools-only allowSteam flag; unless steam is allowed, add every steam machine to constraints.banned.
-
-    Returns (body, allowed). `default` is the draft's own choice (from plan_create), used when the call gives none.
-    """
-    allow = body.pop("allowSteam", None)
-    constraints = dict(body.get("constraints") or {})
-    if allow is None:
-        allow = default if default is not None else constraints.get("tierCap") == "ULV"
-    if allow:
-        return body, True
-    banned = list(constraints.get("banned") or [])
-    seen = {str(b).lower() for b in banned}
-    banned += [m for m in STEAM_MACHINES if m not in seen]
-    constraints["banned"] = banned
-    body["constraints"] = constraints
-    return body, False
 CARD = {
     "type": "object", "additionalProperties": False, "required": ["recipeId"],
     "properties": {
@@ -122,8 +91,8 @@ END_TO = {"type": "object", "additionalProperties": False, "required": ["cardId"
               "Only to pick the input slot when several could take the wire (an 'any of' slot by a member)."))}}
 DRAFT_CONSTRAINTS = dict(CONSTRAINTS, description=(
     "Kept by the draft for every later add and solve: tierCap caps machine tiers (a tier above it is bad_request), "
-    "banned keeps machines and recipes out, free marks resources as raw on purpose. heat, cleanroom and lowgrav do "
-    "nothing to a draft."))
+    "banned keeps machines and recipes out, free marks resources as raw on purpose, steam: true lets steam and "
+    "primitive machines in (default: only at tierCap ULV). heat, cleanroom and lowgrav do nothing to a draft."))
 
 
 def schema(props, required=()):
@@ -149,7 +118,7 @@ ENDPOINTS = {
                 "text": {"type": "string", "minLength": 1, "maxLength": 100},
                 "machine": {"type": "string", "description": "Recipe map or machine name or id, e.g. "
                                                              "'Electrolyzer'."},
-                "constraints": CONSTRAINTS, "allowSteam": ALLOW_STEAM, "limit": LIMIT,
+                "constraints": CONSTRAINTS, "limit": LIMIT,
                 "offset": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 0},
                 "detail": {"type": "boolean"}})),
     "recipes_get": ("recipes/get", (
@@ -157,10 +126,13 @@ ENDPOINTS = {
         "tiers, parallels, overclock and dials (the settings plan_add_cards takes)."),
         schema({"recipeId": ID}, ["recipeId"])),
     "plan_create": ("plans/create", (
-        "Start an empty draft plan on the planner site; returns {planId, name, expiresAt, constraints}. The draft "
-        "expires 24 h after its last change and a site restart drops it. Set the constraints here: plan_solve "
-        "takes none."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS,
-                                                        "allowSteam": ALLOW_STEAM},
+        "Start an empty draft plan on the planner site; returns {planId, name, expiresAt, constraints, cardTier}. "
+        "The draft expires 24 h after its last change and a site restart drops it. Set the constraints and "
+        "cardTier here: plan_solve takes none. A card added without a tier runs at the highest tier at or below "
+        "cardTier its machine is built at."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS,
+                                                        "cardTier": dict(TIER, description=(
+                                                            "The tier cards run at unless given one (default: "
+                                                            "tierCap): the player's own tier."))},
                                                         ["name"])),
     "plan_import": ("plans/import", (
         "Start a draft from a slim plan snapshot (version 1: plan, cards, drawers, wires, targets; see the agent "
@@ -171,8 +143,9 @@ ENDPOINTS = {
     "plan_add_cards": ("plans/add-cards", (
         "Add recipe cards to a draft (recipeIds from recipes_search, machine and dials from recipes_get); returns "
         "{cards, wires, cardCount} with each new card's cardId. Wires between cards are made by resource "
-        "automatically, both ways. Machine and tier default to the cheapest that runs the recipe within tierCap; the "
-        "solver picks machine counts. At most 60 cards per draft; a refused request changes nothing."),
+        "automatically, both ways. Machine defaults to the recipe's first multiblock within tierCap (never a steam "
+        "or primitive one unless the draft allows steam) and tier to the draft's cardTier; the solver picks machine "
+        "counts. At most 60 cards per draft; a refused request changes nothing."),
         schema(dict(PLAN, cards={"type": "array", "minItems": 1, "items": CARD}), ["planId", "cards"])),
     "plan_remove_cards": ("plans/remove-cards", (
         "Remove cards from a draft by id; returns {removed, wiresRemoved, cardCount, targets}. A target on a "
@@ -204,20 +177,22 @@ ENDPOINTS = {
         "Solve a draft with the site's solver (uses the constraints given at plan_create): solved, targetsMet, "
         "targets (made vs rate), unsupplied (raw inputs per second, largest first), byproducts, euT, warnings, then "
         "cards as ROWS laid out by cardColumns: [cardId, recipe, machine, tier, count, in, out, dials?] (count is "
-        "the machines needed, fractional; in/out are per second by resource name)."),
+        "the machines needed, fractional; in/out are per second by resource name). Steam is not in unsupplied or "
+        "euT: a warning line gives the steam the plan's steam machines burn."),
         schema(dict(PLAN, fields={"type": "array", "items": {"type": "string", "enum": [
             "targets", "unsupplied", "byproducts", "power", "warnings", "cards"]},
             "description": "Only these parts (solved and targetsMet always come)."}), ["planId"])),
     "plan_expand_inputs": ("plans/expand-inputs", (
         "What could make each input a draft still needs (it must have a target): up to max candidates per input, "
         "each actually tried in a copy of the draft and solved, with machines, euPerItem, newRaws, "
-        "usesByproducts, works and a plain reason. Inputs marked raw: true may stay unsupplied; accepted lists "
+        "usesByproducts, works, steamPerSecond (steam counted at 2 L per EU in euPerItem) and a plain reason. Inputs "
+        "marked raw: true may stay unsupplied; accepted lists "
         "the free ones. Up to 6 inputs per call: more: true and remaining mean page on with resources. The rank "
         "ignores leftover byproducts (named in reason), calls some never-spawning ore materials raw "
         "and sees only the first 12 recipes per input: judge it, don't just take the top one. "
         "Add your choice with plan_add_cards and its recipeId. constraints apply to this call only."),
         schema(dict(PLAN, resources={"type": "array", "items": RESOURCE, "maxItems": 16}, constraints=CONSTRAINTS,
-                    allowSteam=ALLOW_STEAM, max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
+                    max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
     "plan_diff": ("plans/diff", (
         "For a draft made by plan_import or plan_import_current: store what it ADDS to the player's plan as a "
         "proposal; returns {proposalId, basePlanId, summary, text}. The player applies it in game (/gtnhplanner "
@@ -337,8 +312,6 @@ class Service:
     def __init__(self, env=None, opener=OPENER):
         self.env = os.environ if env is None else env
         self.opener = opener
-        self.draft_steam = {}   # planId -> whether plan_create allowed steam machines (tools-side; see STEAM_MACHINES)
-        self.draft_tier = {}    # planId -> plan_create's tierCap: the tier a card without one runs at (add_cards_at_cap)
 
     def settings(self):
         """(api base, token), read at call time; raises PlannerError when either is missing."""
@@ -454,42 +427,6 @@ class Service:
 
     # ---- dispatch
 
-    def add_cards_at_cap(self, endpoint, body):
-        """plans/add-cards with every card that names no tier set to the draft's tierCap.
-
-        The site would run such a card at the machine's lowest tier, which for a player building at EV means ULV
-        machines. A card the site refuses at the cap (the machine isn't built at that tier) is sent again without
-        it, so the site picks its own tier for that card; the answer's toolNote says which cards those were.
-        """
-        cap = self.draft_tier.get(body.get("planId"))
-        set_at_cap = set()
-        if cap:
-            for i, card in enumerate(body["cards"]):
-                if isinstance(card, dict) and "tier" not in card:
-                    card["tier"] = cap
-                    set_at_cap.add(i)
-        fell_back = []
-        while True:
-            try:
-                resp = self.post(endpoint, body)
-                break
-            except PlannerError as e:
-                m = re.search(r"^planner error (?:bad_request|tier_too_low): cards\[(\d+)\]", str(e))
-                i = int(m.group(1)) if m else -1
-                if i not in set_at_cap:
-                    raise
-                del body["cards"][i]["tier"]
-                set_at_cap.discard(i)
-                fell_back.append(i)
-        if set_at_cap or fell_back:
-            note = "cards without a tier run at the tier cap (%s)" % cap
-            if fell_back:
-                note += "; the site refused %s for cards[%s], so they run at the site's default tier" % (
-                    cap, ", ".join(map(str, sorted(fell_back))))
-            if isinstance(resp, dict):
-                resp["toolNote"] = note
-        return resp
-
     def call(self, name, args):
         """Returns the tool's text; raises PlannerError for a tool error."""
         if name == IMPORT_CURRENT["name"]:
@@ -502,20 +439,11 @@ class Service:
         if missing:
             raise PlannerError("missing argument(s): %s" % ", ".join(missing))
         body = clean(args)
-        steam = None
-        if name in STEAM_TOOLS:
-            body, steam = apply_steam_rule(body, self.draft_steam.get(body.get("planId")))
         if name == "plan_add_cards":
             if not isinstance(body.get("cards"), list):
                 raise PlannerError("cards must be a list")
             body["cards"] = [api_card(c) for c in body["cards"]]
-        if name == "plan_add_cards":
-            resp = self.add_cards_at_cap(endpoint, body)
-        else:
-            resp = self.post(endpoint, body)
-        if name == "plan_create" and isinstance(resp, dict) and isinstance(resp.get("planId"), str):
-            self.draft_steam[resp["planId"]] = steam
-            self.draft_tier[resp["planId"]] = (body.get("constraints") or {}).get("tierCap")
+        resp = self.post(endpoint, body)
         if name == "plan_deliver":
             resp = shrink_delivery(resp)
         return fit(compact(resp))

@@ -143,9 +143,7 @@ class Endpoints(Base):
                            ("plans-diff", "plan_diff"), ("plans-expand-inputs", "plan_expand_inputs")):
             ex = EXAMPLES[name]
             self.site.routes[ex["endpoint"]] = (ex["status"], ex["response"])
-            extra = {"allowSteam": True} if tool in server.STEAM_TOOLS else {}
-            self.service.draft_tier.clear()    # exact pass-through here; the tier backstop has its own tests
-            text, err = self.call(tool, **ex["request"], **extra)
+            text, err = self.call(tool, **ex["request"])
             self.assertFalse(err, text)
             self.assertEqual(json.loads(text), ex["response"])
             self.assertEqual(text, server.compact(ex["response"]))   # compact, unindented
@@ -195,32 +193,6 @@ class Endpoints(Base):
         text, _ = self.call("plan_deliver", **ex["request"])
         self.assertEqual(json.loads(text), short)
 
-    def test_steam_machines_banned_unless_allowed(self):
-        self.site.routes["plans/create"] = (200, {"planId": "xa"})
-        self.site.routes["plans/expand-inputs"] = (200, {"inputs": []})
-        self.site.routes["recipes/search"] = (200, {"results": []})
-        self.call("plan_create", name="n", constraints={"tierCap": "EV", "banned": ["Steam-Grinder"]})
-        sent = self.site.requests[-1]["body"]["constraints"]
-        self.assertEqual(sent["tierCap"], "EV")
-        self.assertEqual(sent["banned"][0], "Steam-Grinder")
-        self.assertEqual(len(sent["banned"]), len(server.STEAM_MACHINES))   # no duplicate, case-insensitive
-        self.assertNotIn("allowSteam", self.site.requests[-1]["body"])
-        self.call("recipes_search", text="dust")                            # no tierCap: still banned
-        self.assertEqual(self.site.requests[-1]["body"]["constraints"]["banned"], list(server.STEAM_MACHINES))
-        self.call("recipes_search", text="dust", allowSteam=True)
-        self.assertNotIn("constraints", self.site.requests[-1]["body"])
-        self.call("plan_create", name="n", constraints={"tierCap": "ULV"})  # steam age: allowed by default
-        self.assertNotIn("banned", self.site.requests[-1]["body"]["constraints"])
-
-    def test_expand_follows_the_drafts_steam_choice(self):
-        self.site.routes["plans/create"] = (200, {"planId": "xsteam"})
-        self.site.routes["plans/expand-inputs"] = (200, {"inputs": []})
-        self.call("plan_create", name="n", constraints={"tierCap": "ULV"})
-        self.call("plan_expand_inputs", planId="xsteam")
-        self.assertNotIn("constraints", self.site.requests[-1]["body"])
-        self.call("plan_expand_inputs", planId="xother")                    # unknown draft (e.g. imported): banned
-        self.assertEqual(self.site.requests[-1]["body"]["constraints"]["banned"], list(server.STEAM_MACHINES))
-
     def test_every_tool_maps_to_its_endpoint(self):
         args = {"resources_search": {"text": "x"}, "recipes_search": {"text": "x"}, "recipes_get": {"recipeId": "r"},
                 "plan_create": {"name": "n"}, "plan_import": {"snapshot": {}},
@@ -237,8 +209,7 @@ class Endpoints(Base):
         for tool, a in args.items():
             endpoint = server.ENDPOINTS[tool][0]
             self.site.routes[endpoint] = (200, {"ok": tool})
-            extra = {"allowSteam": True} if tool in server.STEAM_TOOLS else {}   # steam rule: own test
-            text, err = self.call(tool, **a, **extra)
+            text, err = self.call(tool, **a)
             self.assertFalse(err, text)
             self.assertEqual(json.loads(text), {"ok": tool})
             self.assertEqual(self.site.requests[-1]["endpoint"], endpoint)
@@ -246,7 +217,7 @@ class Endpoints(Base):
 
     def test_player_is_passed_through_and_nulls_dropped(self):
         self.site.routes["plans/create"] = (200, {"planId": "p1"})
-        text, err = self.call("plan_create", name="Titanium", constraints=None, allowSteam=True,
+        text, err = self.call("plan_create", name="Titanium", constraints=None,
                               player={"name": "Steve", "uuid": "00000000-0000-0000-0000-000000000001"})
         self.assertEqual(json.loads(text), {"planId": "p1"})
         self.assertEqual(self.site.requests[-1]["body"], {
@@ -419,41 +390,6 @@ class Cards(Base):
             {"recipeId": "r1", "machine": "electric-blast-furnace", "tier": "HV",
              "dials": {"heatingCoil": "kanthal", "batchSize": 4}},
             {"recipeId": "r2"}])
-
-    def test_cards_without_a_tier_run_at_the_cap(self):
-        self.site.routes["plans/create"] = (200, {"planId": "xev"})
-        self.call("plan_create", name="n", constraints={"tierCap": "EV"})
-
-        def add(body):
-            for i, card in enumerate(body["cards"]):
-                if card.get("tier") == "EV" and card["recipeId"] == "lv-only":
-                    return 400, {"error": {"code": "bad_request",
-                                           "message": "cards[%d]: Mixer is not built at EV." % i}}
-            return 200, {"cards": [{"cardId": "c%d" % (i + 1), "tier": c.get("tier", "LV")}
-                                   for i, c in enumerate(body["cards"])]}
-
-        self.site.routes["plans/add-cards"] = add
-        text, err = self.call("plan_add_cards", planId="xev", cards=[
-            {"recipeId": "a"}, {"recipeId": "lv-only"}, {"recipeId": "b", "tier": "HV"}])
-        self.assertFalse(err, text)
-        sent = [r["body"]["cards"] for r in self.site.requests if r["endpoint"] == "plans/add-cards"]
-        self.assertEqual(sent[0], [{"recipeId": "a", "tier": "EV"}, {"recipeId": "lv-only", "tier": "EV"},
-                                   {"recipeId": "b", "tier": "HV"}])
-        self.assertEqual(sent[-1], [{"recipeId": "a", "tier": "EV"}, {"recipeId": "lv-only"},
-                                    {"recipeId": "b", "tier": "HV"}])
-        out = json.loads(text)
-        self.assertEqual([c["tier"] for c in out["cards"]], ["EV", "LV", "HV"])
-        self.assertIn("cards[1]", out["toolNote"])
-
-    def test_tier_cap_errors_on_given_tiers_pass_through(self):
-        self.site.routes["plans/create"] = (200, {"planId": "xev2"})
-        self.call("plan_create", name="n", constraints={"tierCap": "EV"})
-        self.site.routes["plans/add-cards"] = (400, {"error": {"code": "bad_request",
-                                                               "message": "cards[0]: IV is above the tier cap."}})
-        text, err = self.call("plan_add_cards", planId="xev2", cards=[{"recipeId": "a", "tier": "IV"}])
-        self.assertTrue(err)
-        self.assertIn("above the tier cap", text)
-        self.assertEqual(len([r for r in self.site.requests if r["endpoint"] == "plans/add-cards"]), 1)
 
     def test_api_card(self):
         self.assertEqual(server.api_card({"recipeId": "r", "dials": {"a": 1.5}}), {"recipeId": "r", "dials": {"a": 1.5}})
