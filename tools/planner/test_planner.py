@@ -139,7 +139,8 @@ class Endpoints(Base):
                            ("plans-add-cards", "plan_add_cards"), ("plans-remove-cards", "plan_remove_cards"),
                            ("plans-set-targets", "plan_set_targets"), ("plans-connect", "plan_connect"),
                            ("plans-disconnect", "plan_disconnect"), ("plans-get", "plan_get"),
-                           ("plans-solve", "plan_solve")):
+                           ("plans-solve", "plan_solve"), ("plans-import", "plan_import"),
+                           ("plans-diff", "plan_diff")):
             ex = EXAMPLES[name]
             self.site.routes[ex["endpoint"]] = (ex["status"], ex["response"])
             text, err = self.call(tool, **ex["request"])
@@ -174,6 +175,23 @@ class Endpoints(Base):
         for name, ex in EXAMPLES.items():
             tool = tools[ex["endpoint"]]
             check(ex["request"], server.ENDPOINTS[tool][2], name)
+
+    def test_deliver_leaves_out_the_long_plan_code(self):
+        ex = EXAMPLES["plans-deliver"]
+        resp = dict(ex["response"], url="https://planner.example.invalid/#p=" + ex["response"]["code"])
+        self.site.routes[ex["endpoint"]] = (ex["status"], resp)
+        text, err = self.call("plan_deliver", **ex["request"])
+        self.assertFalse(err, text)
+        out = json.loads(text)
+        self.assertEqual(out["id"], ex["response"]["id"])
+        self.assertEqual(out["cardCount"], ex["response"]["cardCount"])
+        self.assertNotIn(ex["response"]["code"], text)
+        self.assertIn("left out", out["code"])
+        self.assertIn("left out", out["url"])
+        short = dict(ex["response"], code="gtnh1.abc", url="https://planner.example.invalid/#p=gtnh1.abc")
+        self.site.routes[ex["endpoint"]] = (200, short)
+        text, _ = self.call("plan_deliver", **ex["request"])
+        self.assertEqual(json.loads(text), short)
 
     def test_every_tool_maps_to_its_endpoint(self):
         args = {"resources_search": {"text": "x"}, "recipes_search": {"text": "x"}, "recipes_get": {"recipeId": "r"},

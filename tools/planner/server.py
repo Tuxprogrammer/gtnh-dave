@@ -127,8 +127,10 @@ ENDPOINTS = {
         "takes none."), schema({"name": {"type": "string"}, "constraints": DRAFT_CONSTRAINTS},
                                                         ["name"])),
     "plan_import": ("plans/import", (
-        "Start a draft from a plan snapshot as the planner exports it; returns {planId}. For the plan the player "
-        "attached to this panel ask, use plan_import_current instead."),
+        "Start a draft from a slim plan snapshot (version 1: plan, cards, drawers, wires, targets; see the agent "
+        "API spec); returns {planId, name, cardCount, wireCount, warnings}. The draft keeps the plan's own ids; a "
+        "card whose recipe the dataset lacks is kept as is (listed in warnings) and must not be changed. For the "
+        "plan the player attached to this panel ask, use plan_import_current instead."),
         schema({"snapshot": {"type": "object"}}, ["snapshot"])),
     "plan_add_cards": ("plans/add-cards", (
         "Add recipe cards to a draft (recipeIds from recipes_search, machine and dials from recipes_get); returns "
@@ -176,14 +178,17 @@ ENDPOINTS = {
         schema(dict(PLAN, resources={"type": "array", "items": RESOURCE}, constraints=CONSTRAINTS,
                     max={"type": "integer", "minimum": 1, "maximum": 3}), ["planId"])),
     "plan_diff": ("plans/diff", (
-        "For a draft made by plan_import or plan_import_current: store what it adds or changes compared with the "
-        "player's plan as a proposal; returns {proposalId, summary}. The player applies it in game (/gtnhplanner "
-        "apply <id>, or the panel's Apply with proposalId in your <data> block), as one undoable step that only "
-        "adds."), schema(PLAN, ["planId"])),
+        "For a draft made by plan_import or plan_import_current: store what it ADDS to the player's plan as a "
+        "proposal; returns {proposalId, basePlanId, summary, text}. The player applies it in game (/gtnhplanner "
+        "apply <proposalId>, or the panel's Apply with proposalId in your <data> block), as one undoable step that "
+        "only adds. Add-only: if the draft removed or changed anything the player's plan had, it answers "
+        "bad_request naming what; then tell the player that change in words instead. A draft that adds nothing is "
+        "bad_request too."), schema(PLAN, ["planId"])),
     "plan_deliver": ("plans/deliver", (
-        "Store a finished draft for the player as a NEW plan (kept 30 days); returns {name, id, code, url?}. The "
-        "player opens it in game with /gtnhplanner open <id>, or by the plan code. It never changes the player's "
-        "own designs and is not a community post. player needs name and uuid."),
+        "Store a finished draft for the player as a NEW plan (kept 30 days); returns {name, id, cardCount, "
+        "expiresAt}. Give the player the id: they open it in game with /gtnhplanner open <id>. The plan code and "
+        "its site link run to thousands of characters, so they are left out unless short. It never changes the "
+        "player's own designs and is not a community post. player needs name and uuid (the asker's)."),
         dict(schema(PLAN, ["planId", "player"]), properties=dict(PLAN, player=dict(
             PLAYER, required=["name", "uuid"])))),
 }
@@ -191,8 +196,8 @@ ENDPOINTS = {
 IMPORT_CURRENT = {
     "name": "plan_import_current",
     "description": (
-        "Import the plan the player attached to this turn's GTNH Planner panel ask as a draft; returns {planId} and "
-        "which ask the attachment came from. Then change the draft and use plan_diff for a proposal. turn picks "
+        "Import the plan the player attached to this turn's GTNH Planner panel ask as a draft; returns {planId, "
+        "cardCount, wireCount, warnings} and which ask the attachment came from. Then change the draft and use plan_diff for a proposal. turn picks "
         "another turn's attachment."),
     "inputSchema": schema({"turn": {"type": "string", "description": "A turn id (t-0123456789); default: this "
                                                                      "turn, else the asker's newest."}}),
@@ -239,6 +244,18 @@ def clean(value):
     if isinstance(value, list):
         return [clean(v) for v in value]
     return value
+
+
+LONG_FIELD = 300  # deliver's plan code and site link: thousands of characters Dave should never paste into chat
+
+
+def shrink_delivery(resp):
+    """plans/deliver: drop a long plan code and site link (the short id is what the player needs)."""
+    if isinstance(resp, dict):
+        for k in ("code", "url"):
+            if isinstance(resp.get(k), str) and len(resp[k]) > LONG_FIELD:
+                resp[k] = "(left out: %d characters; give the player the id)" % len(resp[k])
+    return resp
 
 
 def compact(obj):
@@ -409,7 +426,10 @@ class Service:
             if not isinstance(body.get("cards"), list):
                 raise PlannerError("cards must be a list")
             body["cards"] = [api_card(c) for c in body["cards"]]
-        return fit(compact(self.post(endpoint, body)))
+        resp = self.post(endpoint, body)
+        if name == "plan_deliver":
+            resp = shrink_delivery(resp)
+        return fit(compact(resp))
 
 
 def handle(service, msg):
