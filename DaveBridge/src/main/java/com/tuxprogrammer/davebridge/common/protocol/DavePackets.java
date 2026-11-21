@@ -21,6 +21,7 @@ public final class DavePackets {
     static {
         register(ClientHello.KIND, ClientHello.class, Direction.TO_SERVER);
         register(Ask.KIND, Ask.class, Direction.TO_SERVER);
+        register(AskCancel.KIND, AskCancel.class, Direction.TO_SERVER);
         register(ClientEvalResult.KIND, ClientEvalResult.class, Direction.TO_SERVER);
         register(ClientSettings.KIND, ClientSettings.class, Direction.TO_SERVER);
         register(ServerHello.KIND, ServerHello.class, Direction.TO_CLIENT);

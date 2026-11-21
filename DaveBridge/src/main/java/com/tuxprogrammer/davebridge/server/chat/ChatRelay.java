@@ -27,6 +27,16 @@ public final class ChatRelay {
      */
     public static int relay(EntityPlayerMP player, String message, String source, boolean triggered, String prompt,
         JsonElement context) {
+        return relay(player, message, source, triggered, prompt, context, null);
+    }
+
+    /**
+     * As {@link #relay(EntityPlayerMP, String, String, boolean, String, JsonElement)}, with {@code extra} fields copied
+     * into the event (a surface ask's {@code surface}, {@code requestId} and {@code attachment}). A surface ask that
+     * reaches no agent is answered with a surface error instead of the chat notice.
+     */
+    public static int relay(EntityPlayerMP player, String message, String source, boolean triggered, String prompt,
+        JsonElement context, JsonObject extra) {
         JsonObject event = Protocol.message("chat");
         event.addProperty(
             "id",
@@ -42,9 +52,25 @@ public final class ChatRelay {
         if (context != null) {
             event.add("context", context);
         }
+        if (extra != null) {
+            for (java.util.Map.Entry<String, JsonElement> e : extra.entrySet()) {
+                event.add(e.getKey(), e.getValue());
+            }
+        }
         int sent = DaveServer.BRIDGE.broadcast(event);
-        if (triggered && sent == 0 && Config.notifyWhenOffline) {
-            player.addChatMessage(DaveChat.notice(Config.botName + " is not connected right now."));
+        if (triggered && sent == 0) {
+            String offline = Config.botName + " is not connected right now.";
+            if (extra != null && extra.has("surface") && extra.has("requestId")) {
+                DaveChat.surfaceError(
+                    player,
+                    extra.get("surface")
+                        .getAsString(),
+                    extra.get("requestId")
+                        .getAsString(),
+                    offline);
+            } else if (Config.notifyWhenOffline) {
+                player.addChatMessage(DaveChat.notice(offline));
+            }
         }
         return sent;
     }

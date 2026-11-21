@@ -67,6 +67,24 @@ public final class ClientModTracker {
         return players.containsKey(player);
     }
 
+    /** The player's client half speaks our protocol version and reported {@code capability} in its hello. */
+    public boolean hasCapability(UUID player, String capability) {
+        return hasCapability(players.get(player), capability);
+    }
+
+    static boolean hasCapability(Info info, String capability) {
+        if (info == null || info.protocol != com.tuxprogrammer.davebridge.common.protocol.DavePackets.PROTOCOL_VERSION
+            || info.capabilities == null) {
+            return false;
+        }
+        for (String c : info.capabilities) {
+            if (capability.equals(c)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public void remove(UUID player) {
         players.remove(player);
     }

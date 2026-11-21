@@ -15,6 +15,8 @@ public final class ClientState {
     public static volatile boolean serverHasMod;
     public static volatile String botName = "Dave";
     public static volatile String[] triggerPrefixes = new String[0];
+    /** The server listed the {@code surface} feature in {@code server_hello}: surface asks are accepted. */
+    public static volatile boolean serverSurfaces;
     /** Longest question the server accepts, from {@code server_hello}. */
     public static volatile int maxAskLength = DEFAULT_ASK_LENGTH;
     /** Client ticks until the opt-in nudge shows; 0 means none is pending. Client thread only. */
@@ -24,6 +26,7 @@ public final class ClientState {
 
     static void reset() {
         serverHasMod = false;
+        serverSurfaces = false;
         botName = "Dave";
         triggerPrefixes = new String[0];
         maxAskLength = DEFAULT_ASK_LENGTH;

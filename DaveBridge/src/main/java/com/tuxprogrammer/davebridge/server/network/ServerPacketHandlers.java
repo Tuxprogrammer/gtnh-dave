@@ -16,11 +16,13 @@ import com.tuxprogrammer.davebridge.Tags;
 import com.tuxprogrammer.davebridge.common.Config;
 import com.tuxprogrammer.davebridge.common.network.DaveNetwork;
 import com.tuxprogrammer.davebridge.common.protocol.Ask;
+import com.tuxprogrammer.davebridge.common.protocol.AskCancel;
 import com.tuxprogrammer.davebridge.common.protocol.ClientEvalResult;
 import com.tuxprogrammer.davebridge.common.protocol.ClientHello;
 import com.tuxprogrammer.davebridge.common.protocol.ClientSettings;
 import com.tuxprogrammer.davebridge.common.protocol.DavePackets;
 import com.tuxprogrammer.davebridge.common.protocol.ServerHello;
+import com.tuxprogrammer.davebridge.common.protocol.Surfaces;
 import com.tuxprogrammer.davebridge.server.ClientModTracker;
 import com.tuxprogrammer.davebridge.server.DaveServer;
 import com.tuxprogrammer.davebridge.server.PlayerJson;
@@ -48,6 +50,7 @@ public final class ServerPacketHandlers {
     public static void register() {
         DaveNetwork.onServer(ClientHello.class, ServerPacketHandlers::onClientHello);
         DaveNetwork.onServer(Ask.class, ServerPacketHandlers::onAsk);
+        DaveNetwork.onServer(AskCancel.class, ServerPacketHandlers::onAskCancel);
         DaveNetwork.onServer(ClientSettings.class, ServerPacketHandlers::onClientSettings);
         // Relayed to the agent only if it answers a client_eval this server sent to this player (ClientEvalRelay).
         DaveNetwork.onServer(ClientEvalResult.class, ClientEvalRelay::onResult);
@@ -95,6 +98,7 @@ public final class ServerPacketHandlers {
             reply.botName = Config.botName;
             reply.triggerPrefixes = Config.triggerPrefixes;
             reply.maxAskLength = Config.maxAskLength;
+            reply.features = new String[] { Surfaces.FEATURE };
             DaveNetwork.sendTo(reply, player);
 
             if (protocol != DavePackets.PROTOCOL_VERSION) {
@@ -154,6 +158,10 @@ public final class ServerPacketHandlers {
         if (!DaveServer.CLIENTS.hasClientMod(player.getUniqueID())) {
             return; // must say hello first
         }
+        if (ask.surface != null || ask.requestId != null) {
+            onSurfaceAsk(ask, player);
+            return;
+        }
         AskCheck check = checkAsk(ask.text, Config.maxAskLength, Config.triggerPrefixes);
         if (check.error != null) {
             DaveBridge.LOG.debug("Rejecting ask from {}: {}", player.getCommandSenderName(), check.error);
@@ -178,6 +186,81 @@ public final class ServerPacketHandlers {
         DaveServer.QUEUE.submit("ask", () -> {
             broadcastQuestion(player, check.text);
             ChatRelay.relay(player, check.text, "client", true, check.prompt, safeContext);
+        });
+    }
+
+    /**
+     * A question from another mod's panel (client API). Private: not shown in chat, answered only to the asker's panel.
+     * Validation failures and the cooldown come back as surface errors, not chat notices.
+     */
+    private static void onSurfaceAsk(Ask ask, EntityPlayerMP player) {
+        if (!Surfaces.validRequestId(ask.requestId)) {
+            DaveBridge.LOG.debug("Dropping surface ask from {}: bad request id", player.getCommandSenderName());
+            return; // nothing to answer to
+        }
+        String requestId = ask.requestId;
+        String surface = Surfaces.validSurface(ask.surface) ? ask.surface : null;
+        String error = surface == null ? "Unknown surface." : surfaceAskError(ask, Config.maxAskLength);
+        if (error != null) {
+            String why = error;
+            String where = surface == null ? "unknown" : surface;
+            DaveBridge.LOG.debug("Rejecting surface ask from {}: {}", player.getCommandSenderName(), why);
+            DaveServer.QUEUE.submit("ask_rejected", () -> DaveChat.surfaceError(player, where, requestId, why));
+            return;
+        }
+        if (!DaveServer.CLIENTS.tryAsk(player.getUniqueID(), System.currentTimeMillis(), Config.askCooldownMillis)) {
+            DaveServer.QUEUE.submit(
+                "ask_cooldown",
+                () -> DaveChat.surfaceError(
+                    player,
+                    surface,
+                    requestId,
+                    "Slow down a little, " + Config.botName + " is still reading your last question."));
+            return;
+        }
+        String text = ask.text.trim();
+        String stripped = TriggerMatcher.match(text, Config.triggerPrefixes);
+        String prompt = stripped != null && !stripped.trim()
+            .isEmpty() ? stripped : text;
+        JsonObject context = null;
+        if (ask.context != null && ask.context.isJsonObject()
+            && ask.context.toString()
+                .length() <= MAX_CONTEXT_CHARS) {
+            context = ask.context.getAsJsonObject();
+        }
+        JsonObject extra = new JsonObject();
+        extra.addProperty("surface", surface);
+        extra.addProperty("requestId", requestId);
+        if (ask.attachment != null && !ask.attachment.isJsonNull()) {
+            extra.add("attachment", ask.attachment);
+        }
+        final JsonObject safeContext = context;
+        DaveServer.QUEUE.submit("ask", () -> ChatRelay.relay(player, text, "client", true, prompt, safeContext, extra));
+    }
+
+    /** Null if a surface ask's text and attachment are acceptable, else the reason shown to the asker. */
+    static String surfaceAskError(Ask ask, int maxLength) {
+        String text = ask.text == null ? "" : ask.text.trim();
+        if (text.isEmpty()) {
+            return "Your question is empty.";
+        }
+        if (text.length() > maxLength) {
+            return "Your question is too long (" + text.length() + " characters, at most " + maxLength + ").";
+        }
+        return Surfaces.checkAttachment(ask.attachment);
+    }
+
+    /** The player gave up on a surface ask: tell the agent (PROTOCOL.md 1.3 {@code ask_cancel}). */
+    private static void onAskCancel(AskCancel cancel, EntityPlayerMP player) {
+        if (!DaveServer.CLIENTS.hasClientMod(player.getUniqueID()) || !Surfaces.validRequestId(cancel.requestId)) {
+            return;
+        }
+        String requestId = cancel.requestId;
+        DaveServer.QUEUE.submit("ask_cancel", () -> {
+            JsonObject event = Protocol.message("ask_cancel");
+            PlayerJson.describe(player, event);
+            event.addProperty("requestId", requestId);
+            DaveServer.BRIDGE.broadcast(event);
         });
     }
 

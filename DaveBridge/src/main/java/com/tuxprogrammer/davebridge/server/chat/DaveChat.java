@@ -25,6 +25,8 @@ import com.google.gson.JsonElement;
 import com.tuxprogrammer.davebridge.DaveBridge;
 import com.tuxprogrammer.davebridge.common.Config;
 import com.tuxprogrammer.davebridge.common.network.DaveNetwork;
+import com.tuxprogrammer.davebridge.common.protocol.DaveMessage;
+import com.tuxprogrammer.davebridge.common.protocol.Surfaces;
 import com.tuxprogrammer.davebridge.common.protocol.Thinking;
 import com.tuxprogrammer.davebridge.server.DaveServer;
 import com.tuxprogrammer.davebridge.server.bridge.Protocol;
@@ -188,6 +190,138 @@ public final class DaveChat {
                 DaveNetwork.sendTo(packet, player);
             } else {
                 player.addChatMessage(notice(Config.botName + " is thinking..."));
+            }
+        }
+        return recipients.size();
+    }
+
+    // ------------------------------------------------------------------ surfaces
+
+    /**
+     * A reply to a surface ask (PROTOCOL.md 1.4 {@code say} with {@code surface}): one {@link DaveMessage} to the
+     * asker's
+     * panel, never chat. {@code target} must name one player. A player whose client cannot show surface replies (no
+     * {@code surface} capability) gets the message as an ordinary whisper instead, with a warning ({@code data} is then
+     * lost). Exactly one of {@code text}, {@code markup}, {@code components} and {@code error} is set.
+     */
+    public static SayResult saySurface(String target, String text, String markup, JsonElement components, String error,
+        String surface, String requestId, boolean isFinal, JsonElement data) throws ProtocolException {
+        if (isEveryone(target)) {
+            throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "a surface reply needs a player target");
+        }
+        List<EntityPlayerMP> recipients = resolveTargets(target);
+        List<String> warnings = new ArrayList<>();
+        if (recipients.isEmpty()) {
+            warnings.add("player '" + target + "' is not online; the surface reply was dropped");
+            return new SayResult(0, warnings);
+        }
+        EntityPlayerMP player = recipients.get(0);
+        if (!DaveServer.CLIENTS.hasCapability(player.getUniqueID(), Surfaces.FEATURE)) {
+            warnings.add(
+                "player '" + target
+                    + "' has no client that shows "
+                    + surface
+                    + " replies; sent as a whisper"
+                    + (data != null ? " without its data" : ""));
+            if (error != null) {
+                player.addChatMessage(notice(error));
+                return new SayResult(1, warnings);
+            }
+            SayResult whisper = say(target, text, markup, components, null);
+            warnings.addAll(whisper.warnings);
+            return new SayResult(whisper.recipients, warnings);
+        }
+
+        DaveMessage message = new DaveMessage();
+        message.botName = Config.botName;
+        message.surface = surface;
+        message.requestId = requestId;
+        message.finalReply = isFinal;
+        if (error != null) {
+            message.error = error;
+            message.finalReply = true;
+        } else {
+            MarkupRenderer.Rendered rendered;
+            if (components != null) {
+                rendered = fromComponents(components, warnings);
+            } else if (markup != null) {
+                rendered = renderer(true).render(markup);
+                warnings.addAll(rendered.warnings);
+                message.markup = markup;
+            } else {
+                rendered = plain(text);
+                warnings.addAll(rendered.warnings);
+            }
+            if (rendered.vanillaLines.isEmpty() && data == null) {
+                throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "message is empty");
+            }
+            boolean modLinks = com.tuxprogrammer.davebridge.server.network.ServerPacketHandlers
+                .canUseModLinks(player.getUniqueID());
+            List<IChatComponent> lines = modLinks ? rendered.modLines : rendered.vanillaLines;
+            String[] json = new String[lines.size()];
+            StringBuilder plainText = new StringBuilder();
+            for (int i = 0; i < lines.size(); i++) {
+                IChatComponent line = fit(lines.get(i), warnings);
+                json[i] = IChatComponent.Serializer.func_150696_a(line);
+                if (i > 0) {
+                    plainText.append('\n');
+                }
+                plainText.append(line.getUnformattedText());
+            }
+            message.components = json;
+            message.text = plainText.toString();
+            message.data = data;
+            for (ResolvedLink.RecipientAction action : rendered.actions) {
+                try {
+                    action.apply(player);
+                } catch (Throwable t) {
+                    DaveBridge.LOG.warn("Per-recipient action failed for {}", player.getCommandSenderName(), t);
+                }
+            }
+        }
+        DaveNetwork.sendTo(message, player);
+        if (message.finalReply && message.error == null) {
+            playReplySound(player);
+        }
+        DaveBridge.LOG.info(
+            "({} -> {} [{} {}{}]) {}",
+            Config.botName,
+            player.getCommandSenderName(),
+            surface,
+            requestId,
+            message.finalReply ? "" : ", interim",
+            message.error != null ? "error: " + message.error : message.text);
+        return new SayResult(1, warnings);
+    }
+
+    /** A surface error to one player, from the server itself (refused ask, Dave offline). Server thread. */
+    public static void surfaceError(EntityPlayerMP player, String surface, String requestId, String error) {
+        if (!DaveServer.CLIENTS.hasCapability(player.getUniqueID(), Surfaces.FEATURE)) {
+            player.addChatMessage(notice(error));
+            return;
+        }
+        DaveMessage message = new DaveMessage();
+        message.botName = Config.botName;
+        message.surface = surface;
+        message.requestId = requestId;
+        message.finalReply = true;
+        message.error = error;
+        DaveNetwork.sendTo(message, player);
+    }
+
+    /** The thinking indicator for a surface ask: to the asker's panel, not chat. Returns the number of recipients. */
+    public static int thinkingSurface(String target, String surface, String requestId) throws ProtocolException {
+        if (isEveryone(target)) {
+            throw new ProtocolException(Protocol.ERR_BAD_REQUEST, "a surface thinking needs a player target");
+        }
+        List<EntityPlayerMP> recipients = resolveTargets(target);
+        for (EntityPlayerMP player : recipients) {
+            if (DaveServer.CLIENTS.hasCapability(player.getUniqueID(), Surfaces.FEATURE)) {
+                Thinking packet = new Thinking();
+                packet.botName = Config.botName;
+                packet.surface = surface;
+                packet.requestId = requestId;
+                DaveNetwork.sendTo(packet, player);
             }
         }
         return recipients.size();

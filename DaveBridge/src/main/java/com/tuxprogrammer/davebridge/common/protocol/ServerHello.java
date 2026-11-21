@@ -12,6 +12,8 @@ public class ServerHello extends DavePacket {
     public String[] triggerPrefixes = new String[0];
     /** Longest {@code ask} text the server accepts; 0 from servers that predate the field. */
     public int maxAskLength;
+    /** Optional server features, e.g. {@code "surface"} ({@link Surfaces#FEATURE}); null from older servers. */
+    public String[] features;
 
     @Override
     public String kind() {

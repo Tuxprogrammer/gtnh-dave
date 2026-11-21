@@ -36,7 +36,7 @@ public final class DaveNetwork {
     public static final String CHANNEL = "davebridge";
 
     /** Largest reassembled packet a client may send. Clients are untrusted. */
-    public static final int MAX_TO_SERVER_BYTES = 256 * 1024;
+    public static final int MAX_TO_SERVER_BYTES = 320 * 1024; // a 256 KiB surface attachment plus text and context
     /** Largest reassembled packet the client accepts from the server. */
     public static final int MAX_TO_CLIENT_BYTES = 8 * 1024 * 1024;
 

@@ -31,6 +31,7 @@ public class ClientEventHandler {
             sendHelloIfNewConnection();
             DaveChatRenderer.tick();
             OptIn.tick();
+            SurfaceClient.tick();
         } catch (Throwable t) {
             DaveBridge.LOG.warn("DaveBridge client tick failed", t);
         }
@@ -51,8 +52,10 @@ public class ClientEventHandler {
         ClientHello hello = new ClientHello();
         hello.modVersion = Tags.VERSION;
         // "eval": this client can run client_eval_request (only acted on when clientEvalAllowed is true).
-        hello.capabilities = NeiPages.available() ? new String[] { "render", "ask", "context", "lesson", "nei", "eval" }
-            : new String[] { "render", "ask", "context", "lesson", "eval" };
+        // "surface": shows surface replies (DaveBridgeClientApi) in the asking panel instead of chat.
+        hello.capabilities = NeiPages.available()
+            ? new String[] { "render", "ask", "context", "lesson", "nei", "eval", "surface" }
+            : new String[] { "render", "ask", "context", "lesson", "eval", "surface" };
         hello.clientEvalAllowed = ClientConfig.clientEvalAllowed;
         DaveNetwork.sendToServer(hello);
     }
@@ -79,7 +82,9 @@ public class ClientEventHandler {
     public void onDisconnect(FMLNetworkEvent.ClientDisconnectionFromServerEvent event) {
         // netty thread: only touch thread-safe state here
         ClientState.serverHasMod = false;
+        ClientState.serverSurfaces = false;
         DaveNetwork.resetClientStreams();
+        ClientProxy.QUEUE.submit("surface_disconnect", () -> SurfaceClient.failAll("Disconnected from the server."));
     }
 
     @SubscribeEvent

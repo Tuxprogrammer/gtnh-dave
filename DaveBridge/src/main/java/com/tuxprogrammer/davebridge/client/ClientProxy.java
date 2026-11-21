@@ -13,6 +13,7 @@ import com.tuxprogrammer.davebridge.common.protocol.ClientEvalRequest;
 import com.tuxprogrammer.davebridge.common.protocol.DaveMessage;
 import com.tuxprogrammer.davebridge.common.protocol.DavePackets;
 import com.tuxprogrammer.davebridge.common.protocol.ServerHello;
+import com.tuxprogrammer.davebridge.common.protocol.Surfaces;
 import com.tuxprogrammer.davebridge.common.protocol.Thinking;
 import com.tuxprogrammer.davebridge.common.tasks.MainThreadQueue;
 
@@ -60,14 +61,21 @@ public class ClientProxy extends CommonProxy {
                 ClientState.triggerPrefixes = packet.triggerPrefixes;
             }
             ClientState.maxAskLength = ClientState.askLimit(packet.maxAskLength);
+            ClientState.serverSurfaces = hasFeature(packet.features, Surfaces.FEATURE);
             DaveBridge.LOG.info("Server runs DaveBridge {}", packet.modVersion);
             OptIn.onServerHello();
         }));
-        DaveNetwork.onClient(
-            DaveMessage.class,
-            packet -> QUEUE.submit("dave_message", () -> DaveChatRenderer.showMessage(packet)));
+        DaveNetwork.onClient(DaveMessage.class, packet -> QUEUE.submit("dave_message", () -> {
+            if (packet.surface != null || packet.requestId != null) {
+                SurfaceClient.onMessage(packet); // a panel's answer: never chat
+            } else {
+                DaveChatRenderer.showMessage(packet);
+            }
+        }));
         DaveNetwork.onClient(Thinking.class, packet -> QUEUE.submit("thinking", () -> {
-            if (packet.clear) {
+            if (packet.surface != null || packet.requestId != null) {
+                SurfaceClient.onThinking(packet);
+            } else if (packet.clear) {
                 DaveChatRenderer.clearThinking(); // the answer arrived
             } else {
                 DaveChatRenderer.showThinking(packet.botName);
@@ -80,6 +88,18 @@ public class ClientProxy extends CommonProxy {
             .bus()
             .register(new ClientEventHandler());
         LessonClient.preInit(); // guided demonstrations
+    }
+
+    static boolean hasFeature(String[] features, String feature) {
+        if (features == null) {
+            return false;
+        }
+        for (String f : features) {
+            if (feature.equals(f)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
