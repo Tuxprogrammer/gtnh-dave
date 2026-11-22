@@ -18,9 +18,18 @@
    cheapest wins; empty cells and buckets do not count as a link); only if none is feasible, "weak" (it just has to
    run). The plan says which form held, free inputs (import at no cost, not expanded), bans (recipe id, machine or map, mod, or item: no import).
 5. Runner-up: the same problem with the winning route's last step (the main producer of the target) banned.
-
-Machine counts are at base speed with no overclocking: with standard overclocks EU per item goes UP, so the least-EU
-answer is the un-overclocked one; overclocking changes machine counts, not the ranking.
+6. Overclocks. The LP ranks routes at base speed: with standard overclocks EU per item goes UP, so the least-EU
+   answer is the un-overclocked one, and overclocking changes machine counts, not the ranking. The plan then also
+   gives each GregTech step's machine count at the player's tier (`oc_tier`, default `tier`) from GregTech's own
+   OverclockCalculator, run by the exporter on our server for every recipe, tier and coil (build_db.py keeps the
+   results in `recipe_oc`), so the durations are GTNHRates' as the server runs them. The step runs on the map's
+   single-block machine when it has one (at the highest tier built, up to oc_tier), else on its multiblock. A
+   multiblock whose overclocks would take a recipe under one tick runs extra parallels instead (subtick_parallels,
+   GregTech's rule); a single block stops at one tick and still pays the overclocked EU/t. Not modelled: a
+   multiblock's own parallels and speed bonuses (most GT++ and later multis), amperage and laser overclocks.
+7. Export (`export=True`): the chain as compact JSON for the planner site's `plan_add_chain` tool, which matches each
+   step to the site's own recipe by content (machine, EU/t, duration, inputs, outputs). Planner resource ids are ours
+   with fluids bare ("nitrogen", not "fluid:nitrogen").
 """
 
 import json
@@ -56,6 +65,40 @@ LOCK_MODES = {
 }
 REL_TOL = 1e-5            # lexicographic tolerance: later stages may give up this much of an earlier optimum
 MAX_ORE_MEMBERS = 6
+# The coil a player usually has at each voltage tier (index = tier), for overclocks when no heat is given.
+COIL_BY_TIER = [None, None, "cupronickel", "kanthal", "nichrome", "tpv", "hss-g", "hss-s", "naquadah",
+                "naquadah-alloy", "trinium", "electrum-flux", "awakened-draconium", "infinity", "hypogen"]
+
+
+def subtick_parallels(duration, heat_ocs, regular_ocs, per_oc=2.0):
+    """Recipes a multiblock runs per tick once its overclocks would take a recipe under one tick: GregTech's
+    OverclockCalculator.calculateMultiplierUnderOneTick (the non-laser branch), which ProcessingLogic multiplies the
+    machine's parallels by. Ported line for line from gtnh-src/source/GT5-Unofficial/src/main/java/gregtech/api/util/
+    OverclockCalculator.java (GTNH 2.9.0); test_recipes.py checks it against values from the live server.
+    duration: base ticks (after any duration modifier); per_oc: 2, or 4 for perfect overclocks."""
+    if duration <= 0 or heat_ocs + regular_ocs <= 0:
+        return 1
+    after_heat = duration / 4.0 ** heat_ocs
+    need_heat = math.ceil(math.log(duration) / math.log(4.0))
+    need_regular = math.ceil(math.log(after_heat) / math.log(per_oc))
+    extra_heat = max(heat_ocs - need_heat, 0)
+    extra_regular = max(regular_ocs - need_regular, 0)
+    if heat_ocs >= need_heat:
+        correction = 4.0 ** need_heat / duration
+    elif regular_ocs >= need_regular:
+        correction = per_oc ** need_regular / after_heat
+    else:
+        return 1
+    return max(1, int(math.ceil(4.0 ** extra_heat * per_oc ** extra_regular * correction - 1e-9)))
+
+
+def coil_key(name):
+    return str(name).lower().replace("_", "-").replace(" ", "-")
+
+
+def planner_id(iid):
+    """Our item id -> the planner site's resource id: fluids are bare there."""
+    return iid[6:] if iid.startswith("fluid:") else iid
 
 
 class PlanError(Exception):
@@ -87,7 +130,7 @@ def fmt_unit(iid):
 
 class Planner:
     def __init__(self, con, target, rate=None, tier=None, heat=None, cleanroom=True, lowgrav=False, locks=(),
-                 free=(), banned=(), max_depth=8, max_recipes=3000, per_item=25):
+                 free=(), banned=(), max_depth=8, max_recipes=3000, per_item=25, oc_tier=None):
         if highspy is None:
             raise PlanError("the chain planner needs highspy: pip install -r tools/recipes/requirements.txt")
         self.con = con
@@ -101,6 +144,15 @@ class Planner:
             raise PlanError("rate must be positive")
         self.tier = R.parse_tier(tier)
         self.heat = R.parse_heat(heat, self.tier)
+        if isinstance(oc_tier, str) and oc_tier.strip().lower() in ("none", "off", "no", "base"):
+            self.oc_tier = None
+        else:
+            self.oc_tier = R.parse_tier(oc_tier) if oc_tier not in (None, "") else self.tier
+        if self.oc_tier is not None and self.tier is not None and self.oc_tier > self.tier:
+            raise PlanError("oc_tier %s is above the plan's tier %s" % (R.tier_name(self.oc_tier),
+                                                                       R.tier_name(self.tier)))
+        self._oc_cache, self._map_cache = {}, {}
+        self.want_export = False
         self.cleanroom = True if cleanroom is None else bool(cleanroom)
         self.lowgrav = bool(lowgrav)
         self.max_depth, self.max_recipes, self.per_item = int(max_depth), int(max_recipes), int(per_item)
@@ -518,7 +570,153 @@ class Planner:
                 second = self.solve(extra_bans={best["main"]})
             except PlanError:      # the main step was the locked machine's only usable recipe
                 second = None
-        return best, second
+        return self.add_overclocks(best), self.add_overclocks(second)
+
+    # ---------------------------------------------------------------- overclocks
+    def map_info(self, mp):
+        if mp not in self._map_cache:
+            row = self.con.execute("SELECT oc_profile FROM maps WHERE id = ?", (mp,)).fetchone()
+            # GregTech's own machines first: a GT++ or later multiblock (Volcanus, Industrial Centrifuge) has
+            # parallels and speed bonuses of its own that the counts don't model
+            ms = [dict(m) for m in self.con.execute(
+                "SELECT name, multiblock, tier FROM machines WHERE map = ? ORDER BY multiblock, tier, "
+                "class NOT LIKE 'gregtech.%', priority, name", (mp,))]
+            self._map_cache[mp] = ((row["oc_profile"] if row else None) or "standard", ms)
+        return self._map_cache[mp]
+
+    def variants(self, rid):
+        if rid not in self._oc_cache:
+            try:
+                row = self.con.execute("SELECT variants FROM recipe_oc WHERE recipe_id = ?", (rid,)).fetchone()
+            except Exception:  # a database built before recipe_oc existed
+                row = None
+            self._oc_cache[rid] = json.loads(row["variants"]) if row else []
+        return self._oc_cache[rid]
+
+    def pick_coil(self, coils, tier):
+        """The coil a step's machine runs on: the best one the player's heat allows, else the usual one for the
+        tier, else the first that runs the recipe. coils: keys as exported (cupronickel, hss_g, ...)."""
+        heat_of = {c: R.COILS.get(coil_key(c)) for c in coils}
+        bonus = 100 * max(0, tier - 2)
+        if self.heat is not None:
+            fit = [c for c in coils if heat_of[c] is not None and heat_of[c] + bonus <= self.heat]
+            if fit:
+                return max(fit, key=lambda c: heat_of[c]), "your heat"
+        usual = COIL_BY_TIER[tier] if 0 <= tier < len(COIL_BY_TIER) else None
+        for c in coils:
+            if usual and coil_key(c) == usual:
+                return c, "usual at %s" % R.tier_name(tier)
+        return min(coils, key=lambda c: heat_of[c] or 0), "lowest that runs it"
+
+    def overclock(self, s):
+        """The step at oc_tier with GregTech's overclocks, or None (no tier, not a GT recipe, no variant)."""
+        r = s["recipe"]
+        t = self.oc_tier
+        if t is None or r["source"] != "gregtech" or r["eut"] <= 0:
+            return None
+        vs = self.variants(r["id"])
+        if not vs:
+            return None
+        profile, ms = self.map_info(r["map"])
+        need = r["tier"] or 0
+        singles = [m for m in ms if not m["multiblock"] and m["tier"] is not None and m["tier"] >= max(need, 1)]
+        multis = [m for m in ms if m["multiblock"]]
+        if singles:
+            kind = "single"
+            mt = min(t, max(m["tier"] for m in singles))
+            at = [m for m in singles if m["tier"] == mt] or singles
+            machine = at[0]["name"]
+        else:
+            kind = "multi" if multis else "single"
+            mt = t
+            machine = multis[0]["name"] if multis else (r["machine"] or r["map"])
+        at_tier = [v for v in vs if v[0] == mt]
+        if not at_tier:
+            return None
+        coil = why_coil = None
+        if len(at_tier[0]) > 3:
+            coil, why_coil = self.pick_coil([v[3] for v in at_tier], mt)
+            at_tier = [v for v in at_tier if v[3] == coil]
+        _, ticks, eut = at_tier[0][:3]
+        parallel = 1
+        if kind == "multi" and ticks <= 1:
+            parallel = self._subtick(r, profile, mt, coil, eut)
+        busy = s["runs"] * ticks / 20.0 / parallel
+        return {"tier": mt, "kind": kind, "machine": machine, "ticks": ticks, "eut": eut, "parallel": parallel,
+                "coil": coil, "coil_why": why_coil, "machines": busy,
+                "eu_per_s": s["runs"] * eut * ticks / parallel}
+
+    def _subtick(self, r, profile, tier, coil, eut):
+        """Parallels per tick for a multiblock at the one-tick floor. The number of overclocks comes from the exported
+        EU/t (each overclock is 4x the EU/t), so only GregTech's sub-tick rule itself is ported."""
+        base_eut, duration = float(r["eut"]), float(r["ticks"])
+        heat_ocs_max, per_oc = 0, 2.0
+        level = None
+        if coil is not None:
+            order = ["cupronickel", "kanthal", "nichrome", "tpv", "hss-g", "hss-s", "naquadah", "naquadah-alloy",
+                     "trinium", "electrum-flux", "awakened-draconium", "infinity", "hypogen", "eternal"]
+            level = order.index(coil_key(coil)) if coil_key(coil) in order else 0
+        if profile == "ebf-heat" and coil is not None:
+            surplus = max(0, R.COILS.get(coil_key(coil), 0) + 100 * (tier - 2) - (r["heat"] or 0))
+            base_eut *= 0.95 ** (surplus // 900)
+            heat_ocs_max = surplus // 1800
+        elif profile == "perfect-oc":
+            per_oc = 4.0
+        elif profile == "pyrolyse-coil" and level is not None:
+            duration *= 2.0 / (1.0 + level)
+        elif profile == "oil-cracker-coil" and level is not None:
+            base_eut *= 1.0 - min(0.1 * (level + 1), 0.5)
+        if base_eut <= 0:
+            return 1
+        ocs = max(0, int(round(math.log(max(eut / base_eut, 1.0)) / math.log(4.0))))
+        heat_ocs = min(heat_ocs_max, ocs)
+        return subtick_parallels(duration, heat_ocs, ocs - heat_ocs, per_oc)
+
+    def add_overclocks(self, res):
+        if res is None:
+            return res
+        for s in res["steps"]:
+            s["oc"] = self.overclock(s)
+        return res
+
+    # ---------------------------------------------------------------- export
+    def export(self, res):
+        """The chain for the planner site's plan_add_chain: one step per recipe with what the site needs to find the
+        same recipe (machine = the recipe map's name, EU/t, seconds, consumed inputs, outputs) and the tier to run it at."""
+        steps = []
+        for s in res["steps"]:
+            r = s["recipe"]
+            io = self.io(r["id"])
+            outs = [x for x in io if x["side"] == "out"]
+            main = next((x for x in outs if x["item_id"] == self.target), None) or \
+                max(outs, key=lambda x: x["amount"] * x["chance"])
+            step = {"recipe": r["hash"], "machine": r["machine"], "makes": planner_id(main["item_id"]),
+                    "euT": r["eut"], "seconds": round(r["ticks"] / 20.0, 3),
+                    "in": [[planner_id(x["item_id"]), x["amount"]] for x in io
+                           if x["side"] == "in" and x["consumed"] and not x["item_id"].startswith(("ore:", "choice:"))],
+                    "out": [[planner_id(x["item_id"]), x["amount"]] for x in outs],
+                    "runs": round(s["runs"], 6)}
+            if r["source"] == "gregtech" and r["tier"] is not None:
+                oc = s.get("oc")
+                step["tier"] = R.tier_name(oc["tier"] if oc else max(self.oc_tier or 0, r["tier"]))
+            steps.append(step)
+        out = {"target": {"id": planner_id(self.target), "rate": self.rate}, "steps": steps}
+        cons = {}
+        if self.tier is not None:
+            cons["tierCap"] = R.tier_name(self.tier)
+        if self.heat is not None:
+            cons["heat"] = self.heat
+        if not self.cleanroom:
+            cons["cleanroom"] = False
+        if self.lowgrav:
+            cons["lowgrav"] = True
+        free = sorted(planner_id(i) for i in self.free) + sorted(
+            planner_id(i) for i, _, c in res["imports"] if c == "free")
+        if free:
+            cons["free"] = sorted(set(free))
+        if cons:
+            out["constraints"] = cons
+        return out
 
     # ---------------------------------------------------------------- text
     def name(self, iid):
@@ -532,7 +730,16 @@ class Planner:
         if r["source"] == "crafting":
             count = "by hand / crafter"
         else:
-            count = "%sx machines (%s busy)" % (math.ceil(s["machines"] - 1e-9), R.fmt_num(round(s["machines"], 2)))
+            count = "%sx at base speed (%s busy)" % (math.ceil(s["machines"] - 1e-9),
+                                                    R.fmt_num(round(s["machines"], 2)))
+            oc = s.get("oc")
+            if oc:
+                count += "; %s: %sx %s (%s busy) at %s%s EU/t, %ss per run%s%s" % (
+                    "overclocked" if (oc["ticks"], oc["eut"]) != (r["ticks"], r["eut"]) else "no overclock",
+                    math.ceil(oc["machines"] - 1e-9), oc["machine"], R.fmt_num(round(oc["machines"], 2)),
+                    R.tier_name(oc["tier"]), " " + R.fmt_num(oc["eut"]), R.fmt_num(oc["ticks"] / 20.0),
+                    ", %d parallel per tick" % oc["parallel"] if oc["parallel"] > 1 else "",
+                    ", %s coils (%s)" % (oc["coil"].replace("_", " "), oc["coil_why"]) if oc["coil"] else "")
         return "- #%s %s (%s): %s -> %s | %s runs/s, %s" % (
             r["hash"], r["machine"], R.recipe_flags(r), ins, outs, R.fmt_num(round(s["runs"], 4)), count)
 
@@ -547,6 +754,15 @@ class Planner:
         lines.append("TOTALS: %s EU/t (machines at base speed); %s EU per %s of %s; machines by type: %s" % (
             R.fmt_num(round(eut, 2)), R.fmt_num(round(per, 1)), fmt_unit(self.target), self.name(self.target),
             ", ".join("%s %s" % (k, v) for k, v in self.machine_summary(res).items()) or "none"))
+        ocs = [s for s in res["steps"] if s.get("oc")]
+        if ocs:
+            eu_s = sum(s["oc"]["eu_per_s"] if s.get("oc") else s["recipe"]["eut"] * s["runs"] * s["recipe"]["ticks"]
+                       for s in res["steps"] if s["recipe"]["eut"] > 0)
+            per_oc = eu_s / self.rate * (1000.0 if self.target.startswith("fluid:") else 1.0)
+            lines.append("OVERCLOCKED at %s: %s EU/t; %s EU per %s (%s at base speed); machines by type: %s" % (
+                R.tier_name(self.oc_tier), R.fmt_num(round(eu_s / 20.0, 2)), R.fmt_num(round(per_oc, 1)),
+                fmt_unit(self.target), R.fmt_num(round(per, 1)),
+                ", ".join("%s %s" % kv for kv in self.machine_summary(res, overclocked=True).items()) or "none"))
         lines.append("IMPORTS: " + ("; ".join("%s %s (%s)" % (fmt_rate(i, v), self.name(i), self.why_import.get(i, c))
                                               for i, v, c in sorted(res["imports"], key=lambda t: -t[1]))
                                     or "none"))
@@ -555,19 +771,24 @@ class Planner:
                                                  for i, v in sorted(byp, key=lambda t: -t[1])[:8]) or "none"))
         return lines
 
-    def machine_summary(self, res):
+    def machine_summary(self, res, overclocked=False):
         out = defaultdict(int)
         for s in res["steps"]:
             r = s["recipe"]
             if r["source"] == "crafting":
                 continue
-            out["%s (%s)" % (r["machine"], R.tier_name(r["tier"]) if r["source"] == "gregtech" else "-")] += \
-                math.ceil(s["machines"] - 1e-9)
+            oc = s.get("oc") if overclocked else None
+            if oc:
+                out["%s (%s)" % (oc["machine"], R.tier_name(oc["tier"]))] += math.ceil(oc["machines"] - 1e-9)
+            else:
+                out["%s (%s)" % (r["machine"], R.tier_name(r["tier"]) if r["source"] == "gregtech" else "-")] += \
+                    math.ceil(s["machines"] - 1e-9)
         return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
     def text(self, best, second):
         rate_txt = fmt_rate(self.target, self.rate)
         cons = ["tier %s" % (R.tier_name(self.tier) if self.tier is not None else "any"),
+                "overclocks at %s" % R.tier_name(self.oc_tier) if self.oc_tier is not None else "no overclocks",
                 "coil heat %s" % ("%dK" % self.heat if self.heat is not None else "any"),
                 "cleanroom %s" % ("yes" if self.cleanroom else "no"),
                 "low gravity %s" % ("yes" if self.lowgrav else "no")]
@@ -595,9 +816,13 @@ class Planner:
         for n in dict.fromkeys(self.notes):
             lines.append("NOTE: " + n)
         lines.append("NOTES: least EU per item, raw resources priced by class (free 0, cheap %s, costly %s EU per "
-                     "unit); no overclocking; non-consumed inputs (circuits, molds, lenses) are listed but not "
-                     "counted; slot alternatives are not substituted." % (
+                     "unit); routes are ranked at base speed (overclocking raises EU per item); overclocked counts "
+                     "are GregTech's OverclockCalculator at that tier, one recipe per machine (a multiblock's own "
+                     "parallels and speed bonuses are not counted); non-consumed inputs (circuits, molds, lenses) are "
+                     "listed but not counted; slot alternatives are not substituted." % (
                          R.fmt_num(RAW_PRICE["cheap"]), R.fmt_num(RAW_PRICE["costly"])))
+        if self.want_export:
+            lines.append("PLANNER-CHAIN: " + json.dumps(self.export(best), separators=(",", ":")))
         return "\n".join(lines)
 
     def why_lost(self, best, second):
@@ -623,10 +848,12 @@ class Planner:
 
 
 def plan_chain(con, target, rate=None, tier=None, heat=None, cleanroom=True, lowgrav=False, locks=(), free=(),
-               banned=(), max_depth=8, max_recipes=3000, runner_up=True):
+               banned=(), max_depth=8, max_recipes=3000, runner_up=True, oc_tier=None, export=False):
     """Returns (text, error flag)."""
     try:
-        p = Planner(con, target, rate, tier, heat, cleanroom, lowgrav, locks, free, banned, max_depth, max_recipes)
+        p = Planner(con, target, rate, tier, heat, cleanroom, lowgrav, locks, free, banned, max_depth, max_recipes,
+                    oc_tier=oc_tier)
+        p.want_export = bool(export)
         best, second = p.plan(runner_up=runner_up)
         return p.text(best, second), False
     except (PlanError, ValueError) as e:

@@ -19,6 +19,7 @@ Components and what they depend on:
   recipes   GTNH + tuxmine server pack  (tools/recipe-export/run.sh -> data/recipes.sqlite)
   corpus    GTNH + both tuxmine packs   (tools/gtnh-search/index.py --extract -> data/corpus)
   index     GTNH + both tuxmine packs   (tools/gtnh-search/index.py -> data/index embeddings)
+  code-index GTNH + both tuxmine packs  (tools/gtnh-search/index.py --profile code: embeddings of gtnh-src/source)
 
 Environment: DAVE_AGENT_ROOT (default: this repo; set it when running from a worktree that lacks the git-ignored
 data), TUXMINE_DIR (default <root>/tuxmine), GTNH_PACK_DIR, PACKSTATE_DIR (default <root>/data/packstate),
@@ -35,6 +36,7 @@ COMPONENTS = {
     "recipes": ("server",),
     "corpus": ("server", "client"),
     "index": ("server", "client"),
+    "code-index": ("server", "client"),
 }
 
 

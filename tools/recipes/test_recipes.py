@@ -25,13 +25,18 @@ import item_names  # noqa: E402
 import recipedb as R  # noqa: E402
 import server  # noqa: E402
 
+import planner  # noqa: E402  (imports without highspy; plan_chain then reports it missing)
+
+HAVE_HIGHS = planner.highspy is not None
 try:
-    import planner
-    HAVE_HIGHS = planner.highspy is not None
+    import numpy  # noqa: F401
+    import item_costs
+    HAVE_NUMPY = True
 except ImportError:  # pragma: no cover
-    HAVE_HIGHS = False
+    HAVE_NUMPY = False
 
 SAMPLE = HERE / "testdata" / "oracle-sample.json"
+OC_LIVE = HERE / "testdata" / "overclock-live.json"
 FULL_DB = R.default_db_path()
 
 STEEL = "gregtech:gt.metaitem.01@11305"
@@ -141,6 +146,29 @@ class NormalizerTests(SampleDB):
         r = self.con.execute("SELECT special FROM recipes WHERE map = 'thaumcraft.arcane'").fetchone()
         self.assertIn("incomplete", json.loads(r["special"]))
 
+    def test_overclock_variants_kept(self):
+        """GregTech's own OverclockCalculator results ride along in recipe_oc: the multiblock air centrifuge at stock
+        rates is 1,600 ticks at 7 EU/t; at HV (two overclocks) 400 ticks at 112 EU/t."""
+        r = R.recipe_by_ref(self.con, AIR_CENTRIFUGE)
+        vs = json.loads(self.con.execute("SELECT variants FROM recipe_oc WHERE recipe_id = ?", (r["id"],)).fetchone()[0])
+        self.assertIn([3, 400, 112], vs)
+        self.assertEqual(max(v[0] for v in vs), build_db.MAX_OC_TIER)
+        ebf = self.con.execute("SELECT * FROM recipes WHERE map = 'gt.recipe.blastfurnace' AND heat <= 1801 "
+                               "LIMIT 1").fetchone()
+        vs = json.loads(self.con.execute("SELECT variants FROM recipe_oc WHERE recipe_id = ?",
+                                         (ebf["id"],)).fetchone()[0])
+        self.assertTrue(all(len(v) == 4 for v in vs))
+        self.assertIn("cupronickel", {v[3] for v in vs})
+        self.assertEqual(R.meta(self.con)["counts"]["overclock_variants"],
+                         self.con.execute("SELECT COUNT(*) FROM recipe_oc").fetchone()[0])
+
+    def test_oc_variants_parsing(self):
+        rc = {"status": "computed", "compactVariants": [[1, 10, 32], [14, 1, 2 ** 62], [2, 5, 128, "ebf-heat", "kanthal"],
+                                                        [3, 0, 512], "junk"]}
+        self.assertEqual(json.loads(build_db.oc_variants(rc)), [[1, 10, 32], [2, 5, 128, "kanthal"]])
+        self.assertIsNone(build_db.oc_variants({"status": "missing", "compactVariants": [[1, 10, 32]]}))
+        self.assertIsNone(build_db.oc_variants(None))
+
     def test_raw_resources(self):
         cls = dict(self.con.execute("SELECT item_id, class FROM raw_resources").fetchall())
         self.assertEqual(cls["fluid:air"], "free")
@@ -163,6 +191,8 @@ class QueryTests(SampleDB):
 
     def test_parse(self):
         self.assertEqual(R.parse_tier("hv"), 3)
+        self.assertEqual([R.tier_name(t) for t in (11, 12, 13, 14)], ["UIV", "UMV", "UXV", "MAX"])
+        self.assertEqual(R.parse_tier("UMV"), 12)
         self.assertEqual(R.parse_heat("kanthal", 3), 2801)
         self.assertEqual(R.parse_heat("1800K"), 1800)
         self.assertRaises(ValueError, R.parse_tier, "HVV")
@@ -209,7 +239,7 @@ class ServerTests(SampleDB):
         self.assertEqual(init["result"]["serverInfo"]["name"], "recipes")
         tools = server.handle(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
         self.assertEqual({t["name"] for t in tools},
-                         {"recipe_producers", "recipe_uses", "recipe_get", "item_find", "plan_chain"})
+                         {"recipe_producers", "recipe_uses", "recipe_get", "item_find", "plan_chain", "item_cost"})
         self.assertIsNone(server.handle(svc, {"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
     def test_producers_uses_get_find(self):
@@ -244,6 +274,12 @@ class ServerTests(SampleDB):
         server.serve(svc, stdin, out, workers=1)
         replies = {r["id"]: r for r in map(json.loads, out.getvalue().splitlines())}
         self.assertIn("Steel Ingot", replies[2]["result"]["content"][0]["text"])
+
+    def test_item_cost_without_table(self):
+        """A database the cost pass never ran on says so instead of failing."""
+        text, err = self.call(server.Service(self.db), "item_cost", {"item": "Nitrogen"})
+        self.assertTrue(err)
+        self.assertIn("item_costs.py", text)
 
     def test_missing_db(self):
         svc = server.Service(Path(self.tmp.name) / "missing.sqlite")
@@ -292,6 +328,7 @@ class PlannerGolden:
     The class attributes are the sample's (stock durations); the full-DB class overrides them with GTNHRates'."""
     air_centrifuge, vf_liquid_air, liquid_air_centrifuge = AIR_CENTRIFUGE, VF_LIQUID_AIR, LIQUID_AIR_CENTRIFUGE
     hv_nitrogen_eu = 7 * 1600 / 3.9                       # 11,200 EU per run / 3.9 buckets = 2,871.8 EU per 1,000 L
+    air_centrifuge_hv = (400, 112)                        # GregTech's overclock at HV: 1,600 ticks / 4, 7 EU/t x 16
     vf_route_eu = 1.325 * 480 * 28 + 5 * 1484 / 40.0      # 17,993.5 EU per 1,000 L
 
     def test_hv_nitrogen(self):
@@ -316,6 +353,56 @@ class PlannerGolden:
         self.assertEqual(hashes(best), {self.vf_liquid_air, self.liquid_air_centrifuge})
         self.assertEqual(best["lock_mode"], "route1")
         self.assertAlmostEqual(best["eu_per_unit"] * 1000, self.vf_route_eu, delta=1.0)
+
+    def test_overclocked_counts(self):
+        """Machine counts at the player's tier come from GregTech's own overclock results for the recipe: the step's
+        overclocked ticks and EU/t are the exported HV variant, and its busy count is runs/s x ticks / 20."""
+        p, best, _ = plan(self.con, target="Nitrogen", tier="HV")
+        step = next(s for s in best["steps"] if s["recipe"]["hash"] == self.air_centrifuge)
+        oc = step["oc"]
+        self.assertEqual((oc["tier"], oc["kind"]), (3, "multi"))
+        self.assertEqual((oc["ticks"], oc["eut"]), self.air_centrifuge_hv)
+        self.assertEqual(oc["machine"], "Spinmatron-2737")     # GregTech's own multiblock before GT++'s
+        self.assertAlmostEqual(oc["machines"], step["runs"] * oc["ticks"] / 20.0 / oc["parallel"])
+        self.assertLess(oc["machines"], step["machines"])
+        text = p.text(best, None)
+        self.assertIn("OVERCLOCKED at HV", text)
+        self.assertRegex(text, r"overclocked: \d+x Spinmatron-2737 \([\d.]+ busy\) at HV 112 EU/t")
+        # base speed only, and an overclock tier above the plan's
+        p, best, _ = plan(self.con, target="Nitrogen", tier="HV", oc_tier="none")
+        self.assertTrue(all(s["oc"] is None for s in best["steps"]))
+        self.assertNotIn("OVERCLOCKED", p.text(best, None))
+        with self.assertRaises(planner.PlanError):
+            planner.Planner(self.con, "Nitrogen", tier="HV", oc_tier="EV")
+        # a lower overclock tier than the plan's
+        _, best, _ = plan(self.con, target="Nitrogen", tier="EV", oc_tier="MV")
+        self.assertEqual(next(s for s in best["steps"] if s["recipe"]["hash"] == self.air_centrifuge)["oc"]["tier"], 2)
+
+    def test_ebf_overclock_coils(self):
+        """EBF steps overclock on the player's coils (heat given), else on the coils usual at their tier."""
+        _, best, _ = plan(self.con, target="Steel Ingot", tier="EV", heat="kanthal", locks=["Electric Blast Furnace"])
+        ebf = [s["oc"] for s in best["steps"] if s["recipe"]["map"] == "gt.recipe.blastfurnace" and s["oc"]]
+        self.assertTrue(ebf)
+        self.assertTrue(all(o["coil"] == "kanthal" and o["coil_why"] == "your heat" for o in ebf))
+        self.assertTrue(all(o["machine"] == "Electric Blast Furnace" for o in ebf))
+        _, best, _ = plan(self.con, target="Steel Ingot", tier="EV", locks=["Electric Blast Furnace"])
+        ebf = [s["oc"] for s in best["steps"] if s["recipe"]["map"] == "gt.recipe.blastfurnace" and s["oc"]]
+        self.assertTrue(all(o["coil"] == "nichrome" for o in ebf))
+
+    def test_planner_export(self):
+        """export=True ends the plan with the chain as JSON for the planner site: fluids bare, the plan's limits."""
+        text, err = planner.plan_chain(self.con, "Nitrogen", tier="HV", export=True)
+        self.assertFalse(err, text)
+        line = next(l for l in text.splitlines() if l.startswith("PLANNER-CHAIN: "))
+        chain = json.loads(line[len("PLANNER-CHAIN: "):])
+        self.assertEqual(chain["target"], {"id": "nitrogen", "rate": 1000.0})
+        self.assertEqual(chain["constraints"], {"tierCap": "HV", "free": ["air"]})
+        step = next(s for s in chain["steps"] if s["recipe"] == self.air_centrifuge)
+        self.assertEqual((step["machine"], step["makes"], step["euT"], step["tier"]),
+                         ("Multiblock Centrifuge", "nitrogen", 7, "HV"))
+        self.assertEqual(step["in"], [["air", 10000.0]])
+        self.assertIn(["nitrogen", 3900.0], step["out"])
+        self.assertNotIn("PLANNER-CHAIN", planner.plan_chain(self.con, "Nitrogen", tier="HV")[0])
 
     def test_tier_filter(self):
         """At LV the HV vacuum freezer recipe is out, so the lock cannot be met."""
@@ -366,6 +453,90 @@ class PlannerSampleTests(PlannerGolden, SampleDB):
         self.assertIn("#" + AIR_CENTRIFUGE, r["content"][0]["text"])
 
 
+class SubtickTests(unittest.TestCase):
+    """planner.subtick_parallels is GregTech's calculateMultiplierUnderOneTick, ported; these are the live server's
+    own answers (testdata/overclock-live.json)."""
+
+    def test_matches_live_server(self):
+        cases = json.loads(OC_LIVE.read_text(encoding="utf-8"))["cases"]
+        p = planner.Planner.__new__(planner.Planner)
+        for c in cases:
+            mult, _, eut, _ = c["result"]
+            r = {"eut": c["eut"], "ticks": c["ticks"], "heat": c.get("heat")}
+            self.assertEqual(p._subtick(r, c["profile"], c["tier"], c.get("coil"), eut), mult, c["name"])
+
+    def test_direct(self):
+        self.assertEqual(planner.subtick_parallels(1, 0, 5), 32)
+        self.assertEqual(planner.subtick_parallels(1, 0, 5, 4.0), 1024)
+        self.assertEqual(planner.subtick_parallels(25, 0, 2), 1)
+        self.assertEqual(planner.subtick_parallels(3, 0, 4), 6)
+        self.assertEqual(planner.subtick_parallels(5, 0, 0), 1)
+
+
+@unittest.skipUnless(HAVE_NUMPY, "numpy missing (pip install -r tools/recipes/requirements.txt)")
+class ItemCostTests(unittest.TestCase):
+    """The item-cost pass over the sample (stock durations): every cost is the cheapest standalone way to make one
+    unit, so for nitrogen it is the HV-nitrogen golden."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db = Path(cls.tmp.name) / "recipes.sqlite"
+        build_db.log = lambda msg: None
+        build_db.build(load_sample(), cls.db, {"pack_version": "2.9.0"})
+        cls.info = item_costs.build(cls.db)
+        cls.con = R.connect(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+        cls.tmp.cleanup()
+
+    def test_nitrogen_matches_golden(self):
+        self.assertAlmostEqual(R.cost(self.con, "fluid:nitrogen", 3) * 1000, 7 * 1600 / 3.9, delta=0.5)
+        via = self.con.execute("SELECT r.hash FROM item_costs c JOIN recipes r ON r.id = c.via WHERE c.tier = 3 AND "
+                               "c.item_id = 'fluid:nitrogen'").fetchone()[0]
+        self.assertEqual(via, AIR_CENTRIFUGE)
+        self.assertEqual(R.cost(self.con, "fluid:air", 3), 0.0)
+
+    @unittest.skipUnless(HAVE_HIGHS, "highspy missing")
+    def test_cost_is_plan_chain_stage_one(self):
+        """With no byproduct reuse, the cost is exactly plan_chain's first objective for the item alone."""
+        p, best, _ = plan(self.con, target="Nitrogen", tier="HV")
+        self.assertAlmostEqual(R.cost(self.con, "fluid:nitrogen", 3), best["stages"]["eu"] / p.rate, delta=1e-3)
+
+    def test_tiers_and_unmakeable(self):
+        self.assertEqual(self.info["tiers"][0], "ULV")
+        self.assertEqual(self.info["tiers"][-1], "UXV")
+        self.assertIsNone(R.cost(self.con, NAND, 1))         # cleanroom cutting at HV
+        self.assertIsNotNone(R.cost(self.con, NAND, 3))
+        # a raw resource costs its class price; ores are 'cheap'
+        raw = self.con.execute("SELECT item_id FROM raw_resources WHERE class = 'cheap' AND item_id IN "
+                               "(SELECT item_id FROM item_costs WHERE tier = 3) LIMIT 1").fetchone()
+        if raw:
+            self.assertLessEqual(R.cost(self.con, raw[0], 3), planner.RAW_PRICE["cheap"] * planner.unit_scale(raw[0]))
+
+    def test_tool(self):
+        svc = server.Service(self.db)
+        r = server.handle(svc, {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "item_cost", "arguments": {"item": "Nitrogen", "tier": "HV", "limit": 3}}})["result"]
+        text = r["content"][0]["text"]
+        self.assertFalse(r["isError"], text)
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith("Nitrogen (fluid:nitrogen) at HV: 2,871.8 EU per 1,000 L"), lines[0])
+        first = next(l for l in lines if l.startswith("1. "))
+        self.assertIn("#" + AIR_CENTRIFUGE, first)
+        self.assertIn("machine 2,871.8 EU", first)
+        self.assertIn("also makes Oxygen", first)
+        text = server.handle(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "item_cost", "arguments": {"item": "NAND Chip", "tier": "LV"}}})["result"]["content"][0]["text"]
+        self.assertIn("can't be made at LV; it can from HV", text)
+        text = server.handle(svc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "item_cost", "arguments": {"item": "Air"}}})["result"]["content"][0]["text"]
+        self.assertIn("raw resource, free", text)
+        self.assertIn("any tier (UXV)", text)
+
+
 @unittest.skipUnless(HAVE_HIGHS and FULL_DB.is_file(), "full DB or highspy missing")
 class PlannerFullDBTests(PlannerGolden, unittest.TestCase):
     """The same golden chains against the whole pack (data/recipes.sqlite): no other route may beat them."""
@@ -373,6 +544,7 @@ class PlannerFullDBTests(PlannerGolden, unittest.TestCase):
     air_centrifuge, vf_liquid_air = FULL_AIR_CENTRIFUGE, FULL_VF_LIQUID_AIR
     liquid_air_centrifuge = FULL_LIQUID_AIR_CENTRIFUGE
     hv_nitrogen_eu = 7 * 25 / 3.9                         # 44.9 EU per 1,000 L
+    air_centrifuge_hv = (6, 112)                          # 25 ticks / 4 = 6.25, cut to 6 by GregTech
     vf_route_eu = 1.325 * 480 * 1 + 5 * 24 / 40.0         # 639 EU per 1,000 L
 
     @classmethod
@@ -387,6 +559,17 @@ class PlannerFullDBTests(PlannerGolden, unittest.TestCase):
         _, best, _ = plan(self.con, target="Steel Ingot", tier="HV", heat="cupronickel",
                           locks=["Electric Blast Furnace"])
         self.assertIn(EBF_STEEL, hashes(best))
+
+    @unittest.skipUnless(HAVE_NUMPY, "numpy missing")
+    def test_item_costs_full(self):
+        """The cost pass on the whole pack (when data/recipes.sqlite has it): nitrogen at HV is the HV-nitrogen golden,
+        and titanium dust is not free (the YAFC-style dual priced it at 0 EU by pushing a centrifuge's whole cost onto
+        its other outputs; the standalone cost can't do that)."""
+        if not R.has_costs(self.con):
+            self.skipTest("this recipe database has no item_costs table")
+        self.assertAlmostEqual(R.cost(self.con, "fluid:nitrogen", 3) * 1000, self.hv_nitrogen_eu, delta=0.5)
+        self.assertGreater(R.cost(self.con, "gregtech:gt.metaitem.01@2028", 4), 100)
+        self.assertIsNone(R.cost(self.con, NAND, 1))
 
     def test_nand_chip_producers_hv(self):
         """The question Dave failed in production: what makes NAND chips, at what EU/t."""

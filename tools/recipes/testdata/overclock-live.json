@@ -1,0 +1,156 @@
+{
+ "about": "GregTech's own OverclockCalculator, run through DaveBridge eval on a GTNH 2.9.0 server on 2026-11-22: setRecipeEUt(eut).setEUt(voltage).setDuration(ticks).setParallel(1) [+enablePerfectOC()] [+setRecipeHeat/setMachineHeat/setHeatOC(true)/setHeatDiscount(true)], then calculateMultiplierUnderOneTick() before calculate(), as ParallelHelper does. result = [multiplier, duration, consumption, performed overclocks]. Machine heat = the coil's heat + 100 K per tier above MV.",
+ "cases": [
+  {
+   "name": "std-7eut-1t-LuV",
+   "eut": 7,
+   "ticks": 1,
+   "tier": 6,
+   "profile": "standard",
+   "result": [
+    32,
+    1,
+    7168,
+    5
+   ]
+  },
+  {
+   "name": "std-7eut-25t-HV",
+   "eut": 7,
+   "ticks": 25,
+   "tier": 3,
+   "profile": "standard",
+   "result": [
+    1,
+    6,
+    112,
+    2
+   ]
+  },
+  {
+   "name": "std-120eut-2t-EV",
+   "eut": 120,
+   "ticks": 2,
+   "tier": 4,
+   "profile": "standard",
+   "result": [
+    2,
+    1,
+    1920,
+    2
+   ]
+  },
+  {
+   "name": "std-480eut-1t-LuV",
+   "eut": 480,
+   "ticks": 1,
+   "tier": 6,
+   "profile": "standard",
+   "result": [
+    8,
+    1,
+    30720,
+    3
+   ]
+  },
+  {
+   "name": "std-30eut-3t-IV",
+   "eut": 30,
+   "ticks": 3,
+   "tier": 5,
+   "profile": "standard",
+   "result": [
+    6,
+    1,
+    7680,
+    4
+   ]
+  },
+  {
+   "name": "perfect-7eut-1t-LuV",
+   "eut": 7,
+   "ticks": 1,
+   "tier": 6,
+   "profile": "perfect-oc",
+   "result": [
+    1024,
+    1,
+    7168,
+    5
+   ]
+  },
+  {
+   "name": "perfect-120eut-63t-IV",
+   "eut": 120,
+   "ticks": 63,
+   "tier": 5,
+   "profile": "perfect-oc",
+   "result": [
+    2,
+    1,
+    7680,
+    3
+   ]
+  },
+  {
+   "name": "ebf-120eut-2t-EV-kanthal",
+   "eut": 120,
+   "ticks": 2,
+   "tier": 4,
+   "profile": "ebf-heat",
+   "heat": 1000,
+   "coil": "kanthal",
+   "result": [
+    8,
+    1,
+    1733,
+    2
+   ]
+  },
+  {
+   "name": "ebf-120eut-47t-IV-hssg",
+   "eut": 120,
+   "ticks": 47,
+   "tier": 5,
+   "profile": "ebf-heat",
+   "heat": 1500,
+   "coil": "hss_g",
+   "result": [
+    1,
+    1,
+    6256,
+    3
+   ]
+  },
+  {
+   "name": "ebf-120eut-3t-IV-tpv",
+   "eut": 120,
+   "ticks": 3,
+   "tier": 5,
+   "profile": "ebf-heat",
+   "heat": 1000,
+   "coil": "tpv",
+   "result": [
+    43,
+    1,
+    6256,
+    3
+   ]
+  },
+  {
+   "name": "ebf-1920eut-5t-LuV-naq",
+   "eut": 1920,
+   "ticks": 5,
+   "tier": 6,
+   "profile": "ebf-heat",
+   "heat": 3600,
+   "coil": "naquadah",
+   "result": [
+    7,
+    1,
+    25022,
+    2
+   ]
+  }
+ ]
+}

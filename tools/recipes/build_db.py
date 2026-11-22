@@ -20,6 +20,10 @@ The rules are ported from jackwrichards/gtnh-factory-flow `normalize-oracle-expo
 Added here (Dave): cleanroom / low gravity / coil heat come from the recipe METADATA first (5.09.54 only derives
 mSpecialValue from it when no special value was set, so one EBF recipe carries coil heat in mSpecialValue and its
 cleanroom flag only in metadata), with the old special-value codes (-100/-200/-300) as the fallback.
+Overclocks: the oracle runs GregTech's own OverclockCalculator on every GT recipe at every voltage tier (and every
+coil for the EBF, pyrolyse oven and oil cracker) in the exporting server, so with GTNHRates' durations. Those results
+(`runtimeCalculation.compactVariants`: tier, ticks, EU/t[, profile, coil]) are kept in `recipe_oc`, one JSON list per
+recipe, for plan_chain's machine counts. MAX (tier 14) is left out: its EU/t overflows.
 """
 
 import argparse
@@ -36,7 +40,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import recipedb  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+MAX_OC_TIER = 13              # UXV; GregTech's MAX-tier EU/t overflows a long
 CIRCUIT = "gregtech:gt.integrated_circuit"
 WILDCARD = 32767
 MAP_NAMES = {"gtpp.recipe.cokeoven": "Industrial Coke Oven"}
@@ -228,7 +233,7 @@ class Builder:
         return row
 
     def add_recipe(self, map_id, ins, outs, ticks, eut, special_value=0, *, source, extra=None, fake=False,
-                   hidden=False, heat=None, cleanroom=False, lowgrav=False, tier=None, incomplete=False):
+                   hidden=False, heat=None, cleanroom=False, lowgrav=False, tier=None, incomplete=False, oc=None):
         ins = [r for r in ins if r]
         outs = [r for r in outs if r]
         if not outs:
@@ -260,6 +265,7 @@ class Builder:
             "recycle": int(bool((extra or {}).get("metadata", {}).get("recycle"))),
             "special": json.dumps(special, sort_keys=True) if special else None,
             "io": aggregate(ins, "in") + aggregate(outs, "out"),
+            "oc": oc,
         }
         m["count"] += 1
         return h
@@ -319,7 +325,8 @@ class Builder:
                 fake = bool(r.get("fake"))
                 self.add_recipe(mid, ins, outs, ticks, eut, sv, source="gregtech", extra=extra, fake=fake,
                                 hidden=bool(r.get("hidden")), heat=int(heat) if heat else None,
-                                cleanroom=cleanroom, lowgrav=lowgrav)
+                                cleanroom=cleanroom, lowgrav=lowgrav,
+                                oc=r["_oc"] if "_oc" in r else oc_variants(r.get("runtimeCalculation")))
 
     def crafting(self, dom):
         for r in dom.get("recipes") or []:
@@ -438,6 +445,7 @@ CREATE TABLE recipe_io(recipe_id INTEGER NOT NULL, side TEXT NOT NULL, slot INTE
 CREATE TABLE maps(id TEXT PRIMARY KEY, name TEXT, source TEXT, recipe_count INTEGER, oc_profile TEXT);
 CREATE TABLE machines(map TEXT, item_id TEXT, name TEXT, class TEXT, family TEXT, multiblock INTEGER,
                       tier INTEGER, priority INTEGER);
+CREATE TABLE recipe_oc(recipe_id INTEGER PRIMARY KEY, variants TEXT NOT NULL);
 CREATE TABLE raw_resources(item_id TEXT PRIMARY KEY, class TEXT NOT NULL
                            CHECK (class IN ('free', 'cheap', 'costly', 'never')), note TEXT);
 CREATE VIRTUAL TABLE items_fts USING fts5(name, oredict, id UNINDEXED, tokenize = 'unicode61 remove_diacritics 2');
@@ -508,11 +516,13 @@ def build(export, db_path, run_info=None):
     con = sqlite3.connect(tmp)
     con.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;" + SCHEMA)
     producers, uses = Counter(), Counter()
-    rows_r, rows_io = [], []
+    rows_r, rows_io, rows_oc = [], [], []
     for rid, (h, r) in enumerate(sorted(b.recipes.items()), start=1):
         rows_r.append((rid, h, r["map"], r["machine"], r["source"], r["tier"], r["eut"], r["ticks"], r["amps"],
                        r["circuit"], r["cleanroom"], r["lowgrav"], r["heat"], r["fake"], r["hidden"], r["recycle"],
                        r["special"]))
+        if r.get("oc"):
+            rows_oc.append((rid, r["oc"]))
         plannable = not r["fake"] or r["map"] in REAL_FAKE_MAPS
         for io in r["io"]:
             rows_io.append((rid, io["side"], io["slot"], io["item"], io["stack"], io["chance"], int(io["consumed"]),
@@ -523,6 +533,7 @@ def build(export, db_path, run_info=None):
                 uses[io["item"]] += 1
     con.executemany("INSERT INTO recipes VALUES (%s)" % ",".join("?" * 17), rows_r)
     con.executemany("INSERT INTO recipe_io VALUES (?,?,?,?,?,?,?,?)", rows_io)
+    con.executemany("INSERT INTO recipe_oc VALUES (?,?)", rows_oc)
     rows_i = []
     for iid, e in b.cat.items.items():
         rows_i.append((iid, e["kind"], e["name"] or iid, e["mod"], json.dumps(sorted(e["oredict"])) if e["oredict"] else None,
@@ -559,7 +570,8 @@ def build(export, db_path, run_info=None):
                      for a in adapters],
         "run_info": run_info,
         "counts": {"recipes": len(rows_r), "io_rows": len(rows_io), "items": len(rows_i), "maps": len(b.maps),
-                   "machines": len(b.machines), "raw_resources": len(raw), "duplicates_dropped": b.dupes},
+                   "machines": len(b.machines), "raw_resources": len(raw), "duplicates_dropped": b.dupes,
+                   "overclock_variants": len(rows_oc)},
         "dropped": dict(b.stats),
         "not_normalized": not_normalized,
     }
@@ -574,15 +586,33 @@ def build(export, db_path, run_info=None):
     return meta
 
 
-DROP_KEYS = ("runtimeCalculation", "neiLayout", "icon", "iconPath", "dominantColor")
+DROP_KEYS = ("neiLayout", "icon", "iconPath", "dominantColor")
+
+
+def oc_variants(rc):
+    """A recipe's runtimeCalculation -> its overclock variants as compact JSON ([tier, ticks, eut] or
+    [tier, ticks, eut, coil]), or None. Variants above MAX_OC_TIER and ones with no EU/t are left out."""
+    if not isinstance(rc, dict) or rc.get("status") != "computed":
+        return None
+    out = []
+    for v in rc.get("compactVariants") or []:
+        if not isinstance(v, list) or len(v) < 3 or not all(isinstance(x, int) for x in v[:3]):
+            continue
+        tier, ticks, eut = v[:3]
+        if tier > MAX_OC_TIER or eut <= 0 or ticks <= 0:
+            continue
+        out.append([tier, ticks, eut] + ([v[4]] if len(v) > 4 and isinstance(v[4], str) else []))
+    return json.dumps(out, separators=(",", ":")) if out else None
 
 
 def slim(obj):
-    """json object_hook: drops what the database never uses (overclock variants, NEI layouts, icons) while parsing,
-    which roughly halves the memory a 300+ MB export needs."""
+    """json object_hook: drops what the database never uses (NEI layouts, icons) and shrinks the overclock
+    calculations to their variants while parsing, which roughly halves the memory a 300+ MB export needs."""
     for k in DROP_KEYS:
         if k in obj:
             del obj[k]
+    if "runtimeCalculation" in obj:
+        obj["_oc"] = oc_variants(obj.pop("runtimeCalculation"))
     return obj
 
 

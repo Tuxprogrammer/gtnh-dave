@@ -3,8 +3,9 @@
   python3 -I tools/planner/server.py
 
 One tool per agent API endpoint (spec: https://github.com/Tuxprogrammer/gtnh-factory-flow/blob/main/docs/agent-api.md),
-plus plan_import_current, which imports the plan the player attached to this turn's panel ask. Configuration comes
-from the environment, read at call time:
+plus plan_import_current, which imports the plan the player attached to this turn's panel ask, and plan_add_chain,
+which builds a chain from the recipes server's plan_chain (its PLANNER-CHAIN export) into a draft by matching each
+step to the planner's own recipe by content. Configuration comes from the environment, read at call time:
 
   PLANNER_API_URL          the site's base URL on the internal network, e.g. http://planner.example.invalid:3000
   PLANNER_API_TOKEN_FILE   a file holding the bearer token (the site's AGENT_API_TOKEN)
@@ -220,8 +221,31 @@ IMPORT_CURRENT = {
                                                                      "turn, else the asker's newest."}}),
 }
 
+ADD_CHAIN = {
+    "name": "plan_add_chain",
+    "description": (
+        "Build a chain worked out by the recipes tool plan_chain (called with export: true) into a draft: each step "
+        "of its PLANNER-CHAIN JSON is matched to the planner's own recipe by content (machine, EU/t, duration, "
+        "consumed inputs, outputs: both datasets come from our pack) and added as a card at the draft's cardTier, "
+        "then the chain's target becomes the draft's target (this replaces the draft's targets; set_target: false "
+        "keeps them). Make the draft first with plan_create, using the chain's constraints (tierCap, free) and the "
+        "player's tier as cardTier. Returns each matched step's recipeId and cardId, and each unmatched step with "
+        "the planner's nearest candidates (add the right one with plan_add_cards). Then plan_solve."),
+    "inputSchema": schema({
+        "planId": ID,
+        "chain": {"type": "object", "required": ["steps"],
+                  "description": "The JSON object after 'PLANNER-CHAIN: ' in plan_chain's answer, unchanged.",
+                  "properties": {"target": {"type": "object"}, "steps": {"type": "array", "items": {"type": "object"}},
+                                 "constraints": {"type": "object"}}},
+        "set_target": {"type": "boolean", "default": True}}, ["planId", "chain"]),
+}
+CHAIN_WORKERS = 4
+CHAIN_MAX_STEPS = 40
+SECONDS_TOL = 0.026        # one tick, and rounding
+
 TOOLS = [{"name": n, "description": d, "inputSchema": s} for n, (_, d, s) in ENDPOINTS.items()]
 TOOLS.insert(list(ENDPOINTS).index("plan_import") + 1, IMPORT_CURRENT)
+TOOLS.insert(list(ENDPOINTS).index("plan_add_cards") + 2, ADD_CHAIN)
 
 
 def log(msg):
@@ -231,6 +255,41 @@ def log(msg):
 
 class PlannerError(Exception):
     """A tool failure whose message is safe to hand to Dave."""
+
+
+def _amounts(rows):
+    out = {}
+    for rid, amt in rows:
+        out[rid] = out.get(rid, 0.0) + float(amt)
+    return out
+
+
+def _close(a, b):
+    return abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
+
+
+def chain_match(step, rec):
+    """(True, None) when a planner recipe is the chain step's recipe, else (False, what differs). The step's consumed
+    inputs must each be in the recipe (ore dictionary slots are left out of the export; the planner shows them as one
+    member with alternatives), and the outputs must be the same."""
+    if int(rec.get("euT") or 0) != int(step.get("euT") or 0):
+        return False, "EU/t %s, not %s" % (rec.get("euT"), step.get("euT"))
+    if abs(float(rec.get("seconds") or 0) - float(step.get("seconds") or 0)) > SECONDS_TOL:
+        return False, "%ss, not %ss" % (rec.get("seconds"), step.get("seconds"))
+    have = _amounts((o.get("id"), o.get("amount") or 0) for o in rec.get("outputs") or [])
+    want = _amounts(step.get("out") or [])
+    if set(have) != set(want) or not all(_close(have[k], want[k]) for k in want):
+        return False, "other outputs"
+    ins = {}
+    for i in rec.get("inputs") or []:
+        if i.get("consumed") is False:
+            continue
+        for rid in [i.get("id")] + [a.get("id") if isinstance(a, dict) else a for a in i.get("alternatives") or []]:
+            ins[rid] = ins.get(rid, 0.0) + float(i.get("amount") or 0)
+    for rid, amt in _amounts(step.get("in") or []).items():
+        if rid not in ins or not _close(ins[rid], amt):
+            return False, "other inputs"
+    return True, None
 
 
 def api_card(card):
@@ -425,12 +484,118 @@ class Service:
         source = {k: meta.get(k) for k in ("turn", "surface", "bytes", "earlier") if meta.get(k) is not None}
         return dict(result, attachment=source) if isinstance(result, dict) else result
 
+    # ---- a plan_chain chain
+
+    def find_step(self, step, player):
+        """The planner recipe for one chain step: (recipe, None) or (None, {why, candidates})."""
+        first_in = next((i[0] for i in step.get("in") or []), None)
+        base = {"makes": step.get("makes"), "limit": 25}
+        tries = []
+        if step.get("machine"):
+            if first_in:
+                tries.append(dict(base, machine=step["machine"], takes=first_in))
+            tries.append(dict(base, machine=step["machine"]))
+        if first_in:
+            tries.append(dict(base, takes=first_in))
+        if not tries:
+            tries.append(base)
+        seen, near, errors = set(), [], []
+        for body in tries:
+            if player:
+                body["player"] = player
+            try:
+                resp = self.post("recipes/search", body)
+            except PlannerError as e:
+                errors.append(str(e))
+                continue
+            for rec in resp.get("results") or []:
+                if rec.get("recipeId") in seen:
+                    continue
+                seen.add(rec.get("recipeId"))
+                ok, why = chain_match(step, rec)
+                if ok:
+                    return rec, None
+                near.append({"recipeId": rec.get("recipeId"), "name": rec.get("name"), "euT": rec.get("euT"),
+                             "seconds": rec.get("seconds"), "differs": why})
+        why = errors[0] if errors and not near else "no planner recipe has the same machine, EU/t, duration, " \
+                                                    "inputs and outputs"
+        return None, {"why": why, "candidates": near[:3]}
+
+    def add_chain(self, args):
+        self.settings()
+        chain, plan_id, player = args.get("chain"), args.get("planId"), args.get("player")
+        if not plan_id:
+            raise PlannerError("missing argument(s): planId")
+        steps = chain.get("steps") if isinstance(chain, dict) else None
+        if not isinstance(steps, list) or not steps or not all(isinstance(x, dict) for x in steps):
+            raise PlannerError("chain must be plan_chain's PLANNER-CHAIN object, with a list of steps")
+        if len(steps) > CHAIN_MAX_STEPS:
+            raise PlannerError("the chain has %d steps; at most %d go into one draft" % (len(steps), CHAIN_MAX_STEPS))
+        with ThreadPoolExecutor(CHAIN_WORKERS) as pool:
+            found = list(pool.map(lambda st: self.find_step(st, player), steps))
+        matched, unmatched = [], []
+        for n, (st, (rec, miss)) in enumerate(zip(steps, found), 1):
+            if rec:
+                matched.append((n, st, rec))
+            else:
+                unmatched.append(dict({"step": n, "recipe": st.get("recipe"), "machine": st.get("machine"),
+                                       "makes": st.get("makes")}, **miss))
+        added, uniq = [], {}
+        for n, st, rec in matched:          # one card per planner recipe, even if two steps found the same one
+            uniq.setdefault(rec["recipeId"], (n, st, rec))
+        cards = [{"recipeId": rid} for rid in uniq]
+        resp = None
+        if cards:
+            body = {"planId": plan_id, "cards": cards}
+            if player:
+                body["player"] = player
+            try:
+                resp = self.post("plans/add-cards", body)
+                made = resp.get("cards") or []
+            except PlannerError as e:
+                if not str(e).startswith("planner error bad_request"):
+                    raise
+                made = []                    # one card refused the whole batch: add them one by one
+                for c in cards:
+                    try:
+                        r1 = self.post("plans/add-cards", dict(body, cards=[c]))
+                        made += r1.get("cards") or []
+                        resp = r1
+                    except PlannerError as e1:
+                        n, st, _ = uniq[c["recipeId"]]
+                        unmatched.append({"step": n, "recipe": st.get("recipe"), "machine": st.get("machine"),
+                                          "makes": st.get("makes"), "why": str(e1), "candidates": []})
+            by_recipe = {}
+            for c in made:
+                by_recipe.setdefault(c.get("recipeId"), c)
+            for rid, (n, st, rec) in uniq.items():
+                c = by_recipe.get(rid)
+                if c:
+                    added.append({"step": n, "recipe": st.get("recipe"), "recipeId": rid, "cardId": c.get("cardId"),
+                                  "name": c.get("name") or rec.get("name"), "tier": c.get("tier")})
+        out = {"planId": plan_id, "steps": len(steps), "added": added,
+               "unmatched": sorted(unmatched, key=lambda u: u["step"])}
+        if resp and resp.get("cardCount") is not None:
+            out["cardCount"] = resp["cardCount"]
+        target = chain.get("target") if isinstance(chain.get("target"), dict) else None
+        if args.get("set_target", True) is not False and target and target.get("id") and added:
+            body = {"planId": plan_id, "targets": [{"resource": target["id"], "rate": float(target.get("rate") or 1)}]}
+            if player:
+                body["player"] = player
+            try:
+                out["targets"] = self.post("plans/set-targets", body).get("targets")
+            except PlannerError as e:
+                out["targetError"] = str(e)
+        return out
+
     # ---- dispatch
 
     def call(self, name, args):
         """Returns the tool's text; raises PlannerError for a tool error."""
         if name == IMPORT_CURRENT["name"]:
             return fit(compact(self.import_current(args)))
+        if name == ADD_CHAIN["name"]:
+            return fit(compact(self.add_chain(args)))
         if name not in ENDPOINTS:
             raise PlannerError("unknown tool: %s" % name)
         endpoint, _, sch = ENDPOINTS[name]

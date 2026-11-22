@@ -232,7 +232,7 @@ class Endpoints(Base):
     def test_schemas(self):
         names = [t["name"] for t in server.TOOLS]
         self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 17)
         for t in server.TOOLS:
             s = t["inputSchema"]
             self.assertIs(s["additionalProperties"], False, t["name"])
@@ -403,6 +403,99 @@ class Cards(Base):
         self.assertEqual(self.site.requests, [])
 
 
+# A plan_chain export (tools/recipes/planner.py, export=True) of HV nitrogen through liquid air, and the planner's
+# recipes for it as recipes/search returns them (the live site's answers, cut down).
+CHAIN = {"target": {"id": "nitrogen", "rate": 1000.0}, "constraints": {"tierCap": "HV", "free": ["air"]}, "steps": [
+    {"recipe": "a9ff9939ba889e1d", "machine": "Vacuum Freezer", "makes": "liquidair", "euT": 480, "seconds": 0.05,
+     "in": [["air", 2000.0]], "out": [["liquidair", 1000.0]], "runs": 1.3, "tier": "HV"},
+    {"recipe": "0e1a75fdcc11b572", "machine": "Multiblock Centrifuge", "makes": "nitrogen", "euT": 5, "seconds": 1.2,
+     "in": [["liquidair", 53000.0]], "out": [["nitrogen", 40000.0], ["oxygen", 11000.0], ["argon", 1000.0],
+                                              ["noblegases", 1000.0]], "runs": 0.025, "tier": "HV"},
+    {"recipe": "ffff000011112222", "machine": "Mixer", "makes": "gregtech:gt.metaitem.01@2305", "euT": 30,
+     "seconds": 2.0, "in": [["gregtech:gt.metaitem.01@2032", 1.0]], "out": [["gregtech:gt.metaitem.01@2305", 1.0]],
+     "runs": 0.1}]}
+VF = {"recipeId": "oracle:ds:gregtech:gt-recipe-vacuumfreezer:aaaa", "name": "Vacuum Freezer: Liquid Air",
+      "machine": "Vacuum Freezer", "euT": 480, "seconds": 0.05,
+      "inputs": [{"id": "air", "kind": "fluid", "amount": 2000, "consumed": True}],
+      "outputs": [{"id": "liquidair", "kind": "fluid", "amount": 1000}]}
+VF_OTHER = dict(VF, recipeId="oracle:ds:gregtech:gt-recipe-vacuumfreezer:bbbb", euT=120)
+CENTRIFUGE = {"recipeId": "oracle:ds:gregtech:gt-recipe-multicentrifuge:cccc", "name": "Multiblock Centrifuge: N",
+              "machine": "Spinmatron-2737", "euT": 5, "seconds": 1.2,
+              "inputs": [{"id": "liquidair", "kind": "fluid", "amount": 53000, "consumed": True}],
+              "outputs": [{"id": "nitrogen", "amount": 40000}, {"id": "oxygen", "amount": 11000},
+                          {"id": "argon", "amount": 1000}, {"id": "noblegases", "amount": 1000}]}
+MIXER_NEAR = {"recipeId": "oracle:ds:gregtech:gt-recipe-mixer:dddd", "name": "Mixer: Steel Dust", "euT": 30,
+              "seconds": 4.0, "inputs": [{"id": "gregtech:gt.metaitem.01@2032", "amount": 1, "consumed": True}],
+              "outputs": [{"id": "gregtech:gt.metaitem.01@2305", "amount": 1}]}
+
+
+class AddChain(Base):
+    def setUp(self):
+        super().setUp()
+
+        def search(body):
+            if body["makes"] == "liquidair":
+                return 200, {"results": [VF_OTHER, VF], "total": 2}
+            if body["makes"] == "nitrogen":
+                return 200, {"results": [CENTRIFUGE], "total": 1}
+            return 200, {"results": [MIXER_NEAR], "total": 1}
+
+        def add(body):
+            return 200, {"planId": body["planId"], "cardCount": len(body["cards"]), "cards": [
+                {"cardId": "c%d" % i, "recipeId": c["recipeId"], "name": "card %d" % i, "tier": "HV"}
+                for i, c in enumerate(body["cards"], 1)]}
+        self.site.routes["recipes/search"] = search
+        self.site.routes["plans/add-cards"] = add
+        self.site.routes["plans/set-targets"] = lambda body: (200, {"targets": [
+            {"id": "nitrogen", "rate": body["targets"][0]["rate"], "cardId": "c2"}]})
+
+    def test_matches_by_content_adds_and_targets(self):
+        text, err = self.call("plan_add_chain", planId="p1", chain=CHAIN, player={"name": "Steve"})
+        self.assertFalse(err, text)
+        out = json.loads(text)
+        self.assertEqual([(a["step"], a["recipeId"]) for a in out["added"]],
+                         [(1, VF["recipeId"]), (2, CENTRIFUGE["recipeId"])])   # VF_OTHER differs in EU/t
+        self.assertEqual(out["unmatched"][0]["step"], 3)
+        self.assertEqual(out["unmatched"][0]["candidates"][0]["differs"], "4.0s, not 2.0s")
+        self.assertEqual(out["targets"], [{"id": "nitrogen", "rate": 1000.0, "cardId": "c2"}])
+        adds = [r for r in self.site.requests if r["endpoint"] == "plans/add-cards"]
+        self.assertEqual(len(adds), 1)                          # one batch
+        self.assertEqual(adds[0]["body"], {"planId": "p1", "player": {"name": "Steve"}, "cards": [
+            {"recipeId": VF["recipeId"]}, {"recipeId": CENTRIFUGE["recipeId"]}]})
+        searches = [r["body"] for r in self.site.requests if r["endpoint"] == "recipes/search"]
+        self.assertIn({"makes": "liquidair", "machine": "Vacuum Freezer", "takes": "air", "limit": 25,
+                       "player": {"name": "Steve"}}, searches)
+
+    def test_set_target_off_and_bad_chain(self):
+        text, err = self.call("plan_add_chain", planId="p1", chain=CHAIN, set_target=False)
+        self.assertFalse(err, text)
+        self.assertNotIn("targets", json.loads(text))
+        self.assertFalse([r for r in self.site.requests if r["endpoint"] == "plans/set-targets"])
+        text, err = self.call("plan_add_chain", planId="p1", chain={"steps": []})
+        self.assertTrue(err)
+        self.assertIn("PLANNER-CHAIN", text)
+
+    def test_one_refused_card_does_not_lose_the_rest(self):
+        def add(body):
+            if len(body["cards"]) > 1:
+                return 400, {"error": {"code": "bad_request", "message": "card 2: tier"}}
+            if body["cards"][0]["recipeId"] == CENTRIFUGE["recipeId"]:
+                return 400, {"error": {"code": "bad_request", "message": "machine not built at HV"}}
+            return 200, {"planId": "p1", "cardCount": 1, "cards": [dict(body["cards"][0], cardId="c1")]}
+        self.site.routes["plans/add-cards"] = add
+        out = json.loads(self.call("plan_add_chain", planId="p1", chain=CHAIN)[0])
+        self.assertEqual([a["recipeId"] for a in out["added"]], [VF["recipeId"]])
+        self.assertIn("machine not built at HV", next(u["why"] for u in out["unmatched"] if u["step"] == 2))
+
+    def test_chain_match(self):
+        step = CHAIN["steps"][1]
+        self.assertEqual(server.chain_match(step, CENTRIFUGE), (True, None))
+        self.assertFalse(server.chain_match(step, dict(CENTRIFUGE, outputs=CENTRIFUGE["outputs"][:2]))[0])
+        alt = dict(CENTRIFUGE, inputs=[{"id": "x", "amount": 53000, "consumed": True,
+                                        "alternatives": [{"id": "liquidair"}]}])
+        self.assertTrue(server.chain_match(step, alt)[0])       # an 'any of' slot holding the step's input
+
+
 class ImportCurrent(Base):
     def setUp(self):
         super().setUp()
@@ -486,7 +579,7 @@ class Stdio(Base):
         replies = {r["id"]: r for r in map(json.loads, proc.stdout.splitlines())}
         self.assertEqual(sorted(replies), [1, 2, 3])
         self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "planner")
-        self.assertEqual(len(replies[2]["result"]["tools"]), 16)
+        self.assertEqual(len(replies[2]["result"]["tools"]), 17)
         res = replies[3]["result"]
         self.assertFalse(res["isError"], res)
         self.assertEqual(json.loads(res["content"][0]["text"]), ex["response"])

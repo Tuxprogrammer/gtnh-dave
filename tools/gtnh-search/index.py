@@ -6,10 +6,14 @@
   python3 -I tools/gtnh-search/index.py --seed         copy the baked corpus and index into GTNH_SEARCH_STATE if needed
   python3 -I tools/gtnh-search/index.py                incremental build (embeds only changed chunks)
   python3 -I tools/gtnh-search/index.py --query "best nitrogen source at HV" [-k 8] [--kind quest]
+  python3 -I tools/gtnh-search/index.py --profile code [--stats | --check | --query ...]
+                                                       the code index: real source of the core mods in gtnh-src/source
 
 The packs are the GTNH server pack plus our tuxmine packwiz packs (tuxmine/server, tuxmine/client); see
 tools/packstate.py. --extract and a full build first download the tuxmine URL mods into the jar cache, then stamp
 "corpus" (and a build "index") in data/packstate only when every pack kind was extracted from the current packs.
+The code profile reads gtnh-src/source directly (nothing to extract) and stamps "code-index" when gtnh-src itself is
+stamped current.
 
 Exit codes:
   --extract  0 extracted and stamped, or extracted with no pack here (nothing to stamp, as in the image);
@@ -28,7 +32,7 @@ import semsearch as s  # noqa: E402
 
 # USD per million input tokens for each profile's model, from openrouter.ai/api/v1/embeddings/models on 2026-10-31.
 # Update this together with PROFILES in semsearch.py once eval.py has picked a model.
-PRICE_PER_MTOK = {"prose": 0.06}
+PRICE_PER_MTOK = {"prose": 0.06, "code": 0.12}
 CHARS_PER_TOKEN = 3.5
 
 
@@ -60,12 +64,39 @@ def stamp_current(ctx, profile, extracted, components, log):
     return 0
 
 
+def stamp_code(ctx, log):
+    """Stamps code-index when the source it read (gtnh-src) is stamped current. Returns the exit code."""
+    if ctx.readonly:
+        print("not stamped: read-only mode", file=sys.stderr)
+        return 1
+    ps = s.load_packstate()
+    if ps is None:
+        print("not stamped: tools/packstate.py could not be loaded", file=sys.stderr)
+        return 1
+    bad = ps.check(["gtnh-src"])
+    if bad:
+        print("not stamped: gtnh-src is not current (%s); run tools/refresh-pack-data.sh" % "; ".join(
+            why for _, why in bad), file=sys.stderr)
+        return 1
+    fp = ps.state()["fingerprints"]["code-index"]
+    if s.stamp_pack(ctx, "code-index", fp, "tools/gtnh-search/index.py --profile code") is None:
+        print("not stamped: the packs changed during the run; run it again", file=sys.stderr)
+        return 1
+    print("stamped code-index (%s)" % fp)
+    return 0
+
+
 def check(ctx, profile, path, log):
     """packstate's check of corpus and index, plus what the data itself records: each pack kind's docs.jsonl header
     and the index's meta must name the current packs. Returns the problems as (component, text)."""
     ps = s.load_packstate()
     if ps is None:
         return [("*", "tools/packstate.py could not be loaded (it needs Python 3.11 or newer)")]
+    if profile == "code":
+        bad = ps.check(["code-index"])
+        if not s.read_index(path, log):
+            bad.append(("code-index", "no index at %s" % path))
+        return bad
     bad = ps.check(["corpus", "index"])
     fp = ps.state()["fingerprints"]["corpus"]
     for kind in s.pack_kinds(profile):
@@ -97,6 +128,9 @@ def main():
     ap.add_argument("--query")
     ap.add_argument("-k", type=int, default=8)
     ap.add_argument("--kind", choices=("any",) + s.KINDS, default="any")
+    ap.add_argument("--yes", action="store_true", help="build even when it would embed more than --max-usd")
+    ap.add_argument("--max-usd", type=float, default=1.0,
+                    help="refuse a build whose estimated embedding cost is above this (default 1.0), unless --yes")
     a = ap.parse_args()
 
     ctx = s.Context()
@@ -119,6 +153,10 @@ def main():
             wiki, created = living_wiki.ensure(ctx, log)
             print("living wiki created at %s" % wiki.dir if created else "living wiki: %s" % ("present" if wiki.exists() else "none (no wiki snapshot)"))
         return 1 if done is None else 0
+
+    if a.extract and a.profile == "code":
+        print("the code profile has nothing to extract: it reads gtnh-src/source directly", file=sys.stderr)
+        return 0
 
     if a.extract:
         if ctx.readonly:
@@ -185,14 +223,28 @@ def main():
         print(s.format_hits(s.search(index, api.query(a.query), a.k, a.kind)))
         return 0
 
-    if ctx.has_pack() and not ctx.readonly:
+    if ctx.has_pack() and not ctx.readonly and a.profile != "code":
         err = s.fetch_extras(ctx, log)  # before any embedding, so a failed download costs nothing
         if err:
             print(err, file=sys.stderr)
             return 1
-    index = s.build(ctx, api, path, a.profile, log=log)
+    with s.corpus_lock(ctx, a.profile):
+        chunks = s.corpus_chunks(ctx, profile["kinds"], log)
+        extracted = dict(ctx.extracted)
+    old = s.read_index(path, log)
+    known = {c["id"] for c in old["chunks"]} if old else set()
+    new = [c for c in {c["id"]: c for c in chunks}.values() if c["id"] not in known]
+    cost = estimate(sum(len(s.embed_text(c)) for c in new), a.profile)
+    print("%d chunks, %d to embed, about $%.3f" % (len(chunks), len(new), cost), file=sys.stderr)
+    if cost > a.max_usd and not a.yes:
+        print("not building: the estimate is above --max-usd %.2f (pass --yes to go ahead)" % a.max_usd,
+              file=sys.stderr)
+        return 1
+    index = s.build(ctx, api, path, a.profile, chunks=chunks, log=log, extracted=extracted)
     if not index:
         return 1
+    if a.profile == "code":
+        return stamp_code(ctx, log)
     return stamp_current(ctx, a.profile, index["meta"].get("corpus_pack"), ["corpus", "index"], log)
 
 

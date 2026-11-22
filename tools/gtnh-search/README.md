@@ -7,7 +7,8 @@ Gives Dave a `gtnh_search` tool that searches GT New Horizons knowledge by meani
 - the `en_US.lang` player text of every mod: item and machine names, tooltips, structure hints, including our own extra mods from the tuxmine packs (GregGuns, EZStorage, Lost Cities, Qz-Miner, …);
 - an offline copy of wiki.gtnewhorizons.com, from Miraheze's archive.org backups and refreshed weekly (see [The wiki](#the-wiki));
 - Dave's own saved answers (`playbook`) and server notes (`memory`);
-- item cards from the recipe database, once they are generated (the `item` source is still a stub).
+- item cards from the recipe database: one per item and fluid, with what makes it, what it is used in, and for a machine its Java class and source file;
+- separately (`kind="code"`), the real source of the core mods, by class member, under a code embedding model.
 
 Dave uses it to turn a player's loose wording ("liquid air", "N2", "that blue circuit") into real item names and IDs, and to find written advice: which quest covers a machine, what a multiblock needs, how a mechanic works.
 
@@ -25,7 +26,8 @@ The code is ported from GregGuns' `tools/semantic-search` (same owner, itself po
   | `guide` | `config/guidenh/DefaultGuide.zip` (the GTNH Guide Pack 0.1.26 resource pack, CC BY-NC-SA 4.0), plus any `assets/<ns>/guidenh/_en_us/*.md` in mod jars (the tuxmine packs' jars too, e.g. GregGuns' guide) or `resourcepacks/`. | One page. Front matter gives `item_ids` and `quest_ids`; item tags become item names; 3D scenes and recipe widgets are dropped. Split at headings. |
   | `lang` | `assets/<ns>/lang/en_US.lang` in every jar (the GTNH pack's and the tuxmine packs') and in the vanilla server jar, GregTech's multiblock tooltip Markdown (`assets/gregtech/lang/en_US/tooltip/*.md`), and a runtime `GregTech.lang` when one is in the pack directory or `data/corpus/lang/extra/`. | One mod's entries, split by size; one tooltip file. |
   | `wiki` | `data/corpus/wiki/`, written by `mirror_wiki.py --from-dump` and `update_wiki.py`. | One page, split at section headings, keeping the heading path. |
-  | `item` | Stub. Will be generated from `data/recipes.sqlite` (built by `tools/recipe-export/run.sh`). | One item or fluid card, keyed `item:<mod:reg:damage>`: name, aliases, ore dictionary names, mod, tooltip, the machine types that make it and its top uses, with `item_ids` in metadata. Returns nothing until the card generator is written. |
+  | `item` | `data/recipes.sqlite` (`DAVE_RECIPES_DB`; built by `tools/recipe-export/run.sh`): every item and fluid some real recipe makes or uses, plus every machine block. About 54,000 cards. | One card, keyed `item:<item id>`: id, mod, ore dictionary names, the recipe maps that make it and use it (counts, lowest tier; recycling counted apart), up to ten things it is used to make, and for a machine block the maps it runs, its Java class and its source file in `gtnh-src/source/` (`path` in metadata). Metadata: `item_ids`. Cached like quests and guides (fingerprint: the database file and `gtnh-src/source-index.json`), so the image ships the cards, not the query. |
+  | `code` (profile `code`) | `gtnh-src/source/<repo>/src/main/java` (`DAVE_GTNH_SRC`) for `CODE_REPOS`: GT5-Unofficial, GTNHLib, Applied-Energistics-2-Unofficial, GregGuns, TrainHorizons (when present); `GTNH_SEARCH_CODE_REPOS` overrides the list. Files over 150 KB and paths matching `CODE_SKIP` (client, GUI, rendering, recipe-registration tables, generated structure strings) are left out. | One Java file, chunked per class member with GregGuns' chunker; small members join the next one and take its signature as the chunk title (`GT5-Unofficial > OverclockCalculator: private int getHeatSurplus()`). Metadata: `path`, `mod`. Not cached: read from `gtnh-src` at build time. |
   | `playbook` | `data/memory/playbook/*.md` | One saved answer: front matter (title, status, pack, asked-by, …) plus body. |
   | `memory` | `data/memory/server/` and `data/memory/lessons/` | One note. |
 
@@ -52,19 +54,21 @@ The code is ported from GregGuns' `tools/semantic-search` (same owner, itself po
   - Document batches get 7 attempts with a 180 s timeout. A player's query gets 2 attempts with a 20 s timeout (`QUERY_ATTEMPTS`, `QUERY_TIMEOUT`).
   - Connection resets and truncated responses are retried like timeouts.
   - Redirects are refused, so the key is only ever sent to `openrouter.ai`.
-- **Profiles.** Each index profile has its own model and index file (`PROFILES` in `semsearch.py`). Only `prose` exists now. The planned `code` index (a code model over real source) becomes a second profile plus its sources, with no other change.
+- **Profiles.** Each index profile has its own model and index file (`PROFILES` in `semsearch.py`).
+  - `prose` (`voyageai/voyage-4`): every kind but `code`. `gtnh_search` with any other `kind`, or `any`, searches it.
+  - `code` (`voyageai/voyage-code-4`): the `code` kind only, searched with `kind="code"` and never mixed in. Built only by `index.py --profile code` (about $1.50 for a full build; afterwards only changed members are embedded). The server loads it beside the prose index but never refreshes it, so a container without `gtnh-src` can't empty it. Its freshness is the packstate component `code-index`, stamped only when `gtnh-src` itself is stamped current.
 - **Index.** `data/index/<profile>__<model>.npz`: git-ignored, written atomically (unique temporary file, fsync, rename), with a lock file so two builds never run at once. Vectors are normalized, so a search is one matrix product.
   - A build saves the vectors it has paid for every 1,024 chunks to `<index>.partial.npz`; after a failure, the next build of the same model starts from them.
   - An unreadable index file is moved to `<index>.npz.corrupt` and rebuilt. Until then the server answers as if there were no index.
   - Its metadata records `corpus_pack`, the packs each pack kind's documents came from (from the `docs.jsonl` headers), and `gtnh_search_status` shows them.
 - **Freshness.** The corpus and the index are pack-derived data, tracked by [`tools/packstate.py`](../packstate.py) as the components `corpus` and `index` (stamps in `data/packstate/`). See [Keeping it fresh](#keeping-it-fresh).
-- **Ranking.** Cosine similarity, at most three chunks per document. In a mixed search, `lang` gets at most a third of the slots, because its long key lists match item names strongly and would crowd out prose. Use `kind` to search one kind only.
+- **Ranking.** Cosine similarity, at most three chunks per document. In a mixed search, `lang` and `item` each get at most a third of the slots: lang's long key lists match item names strongly, and item cards are many and short, so either would crowd out prose. Use `kind` to search one kind only.
 
 ## Setup
 
 1. Put the OpenRouter key in `.env` at the repository root (git-ignored): `OPENROUTER_API_KEY=...`. If the `OPENROUTER_API_KEY` environment variable is set, it is used instead. The key is only for embeddings and has nothing to do with Claude's auth.
 2. Extract the corpus from the pack (no API calls): `python3 -I tools/gtnh-search/index.py --extract`. It uses the newest `.work/gtnh-*/pack`, or `GTNH_PACK_DIR`.
-3. Check the size and cost: `python3 -I tools/gtnh-search/index.py --stats`.
+3. Check the size and cost: `python3 -I tools/gtnh-search/index.py --stats` (`--profile code --stats` for the code index). A build refuses to embed more than `--max-usd` (default $1) unless given `--yes`.
 4. The model is `voyageai/voyage-4`, picked with the eval (see [Eval](#eval)). To change it, set `PROFILES` in `semsearch.py` and `PRICE_PER_MTOK` in `index.py`.
 5. Build: `python3 -I tools/gtnh-search/index.py`.
 
@@ -152,7 +156,10 @@ The corpus and its embeddings must never silently lag behind the packs. After an
 python3 -I tools/gtnh-search/index.py --extract   # 1. downloads missing tuxmine URL mods, re-extracts quest/guide/lang, stamps "corpus"
 python3 -I tools/gtnh-search/index.py             # 2. embeds what changed (OpenRouter), stamps "corpus" and "index"
 python3 -I tools/gtnh-search/index.py --check     # 3. or: python3 -I tools/packstate.py check corpus index
+python3 -I tools/gtnh-search/index.py --profile code   # 4. when gtnh-src changed: embeds changed members, stamps "code-index"
 ```
+
+`tools/refresh-pack-data.sh` runs all of this, in order, for whatever is stale.
 
 Then commit `data/corpus/` and rebuild the image, so the baked seed matches.
 
@@ -164,7 +171,7 @@ Then commit `data/corpus/` and rebuild the image, so the baked seed matches.
 
 What makes a stamp truthful:
 
-- `corpus` is stamped only when every pack kind (`quest`, `guide`, `lang`) was extracted from the current packs, with every tuxmine jar read. A URL mod that is not downloaded, or packs that changed during the run, leave it unstamped.
+- `corpus` is stamped only when every pack kind (`quest`, `guide`, `lang`, `item`) was extracted from the current packs, with every tuxmine jar read. A URL mod that is not downloaded, or packs that changed during the run, leave it unstamped.
 - `index` is stamped only by a full build, and only when the documents it embedded all record the current packs. An index built from an older corpus can never be stamped, and a stamp that would name packs other than the ones the data came from is removed.
 - `--check` compares packstate's stamps with the current packs, and also reads what the data itself records: each `docs.jsonl` header and the index's `corpus_pack`.
 

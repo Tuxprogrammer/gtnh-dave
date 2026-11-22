@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import tempfile
 import time
@@ -39,13 +40,18 @@ CHECKPOINT_CHUNKS = 1024
 # Bump when an extractor's output changes, so cached docs.jsonl files are rebuilt.
 EXTRACT_VERSION = 1
 
-# Index profiles. Each has its own model and index file, so the later `code` index (a code model over real source)
-# can sit beside the prose one without a refactor: add an entry here and a source per kind it covers.
+# Index profiles. Each has its own model and index file. `prose` is everything players read; `code` is real upstream
+# source of the core mods (CODE_REPOS) under a code embedding model, searched only with kind="code".
 PROFILES = {
     "prose": {
-        # Provisional: pick the model with eval.py, then change it here (a new model starts a new index file).
+        # Picked with eval.py (2026-10-31); a new model starts a new index file.
         "model": "voyageai/voyage-4",
         "kinds": ("quest", "guide", "wiki", "item", "lang", "playbook", "memory"),
+    },
+    "code": {
+        # Same family as the prose model, trained on code (GregGuns' own search uses it).
+        "model": "voyageai/voyage-code-4",
+        "kinds": ("code",),
     },
 }
 DEFAULT_PROFILE = "prose"
@@ -60,8 +66,8 @@ MODEL_OPTIONS = {
 
 # Kinds that crowd out prose in a mixed search are capped to a share of the slots (lang chunks are long key=value
 # lists that match item names strongly).
-MIXED_SHARE = {"lang": 3}
-KINDS = ("quest", "guide", "wiki", "item", "lang", "playbook", "memory")
+MIXED_SHARE = {"lang": 3, "item": 3}
+KINDS = ("quest", "guide", "wiki", "item", "lang", "playbook", "memory", "code")
 SKIP_MEMORY_STATUS = {"archived", "superseded"}
 
 
@@ -98,8 +104,11 @@ class Context:
     the image, which seed() copies into the state directory."""
 
     def __init__(self, root=None, pack=None, corpus=None, index=None, memory=None, gtsrc=None, readonly=None, state=None,
-                 tuxmine=None, jar_cache=None):
+                 tuxmine=None, jar_cache=None, recipes_db=None, gtnh_src=None):
         self.root = Path(root) if root else repo_root()
+        # The recipe database (item cards) and the source tree (the code index): the same locations Dave uses.
+        self.recipes_db = Path(recipes_db or os.environ.get("DAVE_RECIPES_DB") or self.root / "data" / "recipes.sqlite")
+        self.gtnh_src = Path(gtnh_src or os.environ.get("DAVE_GTNH_SRC") or self.root / "gtnh-src")
         self.pack = Path(pack) if pack else find_pack(self.root)
         # Our extra mods: the tuxmine packwiz packs layered on the GTNH pack, and the cache packstate downloads their
         # URL mods into. Both absent in the image.
@@ -1446,19 +1455,290 @@ def chunk_wiki(kind, doc):
 SOURCES["wiki"].chunk = chunk_wiki
 
 
-# item: stub. Item cards will be generated from the recipe database (data/recipes.sqlite, Stage 2 of
-# docs/plans/recipe-knowledge.md): one doc per item or fluid, keyed "item:<mod:reg:damage>", whose text holds the
-# display name, aliases, ore dictionary names, mod, tooltip, the machine types that make it and its top uses, and
-# whose meta holds {"item_ids": [...]}. Until that generator is written this source returns nothing.
+# item: one card per item or fluid in the recipe database (data/recipes.sqlite, tools/recipes/), so a player's loose
+# wording ("that blue circuit", "liquid air") lands on a real item id: its name, id, mod, ore dictionary names, the
+# machines that make it and use it (by recipe map, with counts and the lowest tier), what it is used to make, and for
+# a machine block the recipes it runs and its Java class with the source file in gtnh-src/ ("where's the code for the
+# Vacuum Freezer" is then one search). Recycling recipes only count. Items no recipe makes or uses get no card.
+# Cached like the other pack kinds: the image ships the cards, not the database query.
+
+ITEM_TOP = 6
+REAL_FAKE_MAPS = ("gt.recipe.fakeAssemblylineProcess", "gt.recipe.rockbreaker", "gt.recipe.multiblockrockbreaker",
+                  "gt.recipe.treefarm")
+
 
 def item_inputs(ctx):
-    db = ctx.root / "data" / "recipes.sqlite"
-    return [db] if db.is_file() else []
+    # Listed even when missing (a missing file fingerprints as absent), so a pack without a database still records
+    # that its (empty) item cards came from the current packs, and building the database later re-extracts them.
+    return [ctx.recipes_db]
 
 
-@source("item", item_inputs, cache=False, doc="Item cards from the recipe database (not built yet).")
+def item_deps(ctx):
+    idx = ctx.gtnh_src / "source-index.json"
+    return [idx] if idx.is_file() else []
+
+
+def class_source(ctx, cls, cache):
+    """gtnh-src-relative path of a Java class's file in the upstream checkouts, or None."""
+    if not cls or "." not in cls:
+        return None
+    if cls in cache:
+        return cache[cls]
+    rel = cls.split("$", 1)[0].replace(".", "/") + ".java"
+    found = None
+    src = ctx.gtnh_src / "source"
+    if src.is_dir():
+        for repo in sorted(os.listdir(src)):
+            p = src / repo / "src" / "main" / "java" / rel
+            if p.is_file():
+                found = "gtnh-src/source/%s/src/main/java/%s" % (repo, rel)
+                break
+    cache[cls] = found
+    return found
+
+
+def fmt_count_list(rows, limit=ITEM_TOP):
+    """[(name, count, min tier)] -> 'Blast Furnace (12, from MV), Furnace (3)'."""
+    tiers = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV", "UEV", "UIV", "UMV", "UXV", "MAX"]
+    out = []
+    for name, n, t in rows[:limit]:
+        out.append("%s (%d%s)" % (name, n, ", from %s" % tiers[t] if t is not None and 0 <= t < len(tiers) else ""))
+    more = len(rows) - limit
+    return ", ".join(out) + (", and %d more" % more if more > 0 else "")
+
+
+@source("item", item_inputs, chunk=lambda kind, doc: chunk_whole(kind, doc), deps=item_deps,
+        doc="Item cards from the recipe database (data/recipes.sqlite).")
 def discover_items(ctx):
-    return iter(())
+    if not ctx.recipes_db.is_file():
+        return
+    con = sqlite3.connect("file:%s?mode=ro" % ctx.recipes_db, uri=True)
+    try:
+        yield from item_cards(ctx, con)
+    finally:
+        con.close()
+
+
+def item_cards(ctx, con):
+    names = dict(con.execute("SELECT id, name FROM items"))
+    real = "r.recycle = 0 AND (r.fake = 0 OR r.map IN (%s))" % ",".join("'%s'" % m for m in REAL_FAKE_MAPS)
+    made, used, recycled, makes = {}, {}, {}, {}
+    for iid, machine, n, t in con.execute(
+            "SELECT io.item_id, r.machine, COUNT(DISTINCT r.id), MIN(r.tier) FROM recipe_io io JOIN recipes r "
+            "ON r.id = io.recipe_id WHERE io.side = 'out' AND %s GROUP BY io.item_id, r.machine" % real):
+        made.setdefault(iid, []).append((machine, n, t))
+    for iid, machine, n, t in con.execute(
+            "SELECT io.item_id, r.machine, COUNT(DISTINCT r.id), MIN(r.tier) FROM recipe_io io JOIN recipes r "
+            "ON r.id = io.recipe_id WHERE io.side = 'in' AND %s GROUP BY io.item_id, r.machine" % real):
+        used.setdefault(iid, []).append((machine, n, t))
+    for iid, n in con.execute("SELECT io.item_id, COUNT(DISTINCT r.id) FROM recipe_io io JOIN recipes r "
+                              "ON r.id = io.recipe_id WHERE io.side = 'out' AND r.recycle = 1 GROUP BY io.item_id"):
+        recycled[iid] = n
+    for src, dst, n in con.execute(
+            "SELECT i.item_id, o.item_id, COUNT(DISTINCT r.id) FROM recipe_io i JOIN recipes r ON r.id = i.recipe_id "
+            "JOIN recipe_io o ON o.recipe_id = i.recipe_id AND o.side = 'out' AND o.item_id != i.item_id "
+            "WHERE i.side = 'in' AND i.consumed = 1 AND %s GROUP BY i.item_id, o.item_id" % real):
+        makes.setdefault(src, []).append((n, dst))
+    maps = dict(con.execute("SELECT id, name FROM maps"))
+    machines, classes = {}, {}
+    for item_id, mp, name, cls, multi, tier in con.execute(
+            "SELECT item_id, map, name, class, multiblock, tier FROM machines WHERE item_id IS NOT NULL"):
+        machines.setdefault(item_id, []).append((maps.get(mp) or mp, cls, multi, tier))
+    tiers = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV", "UEV", "UIV", "UMV", "UXV", "MAX"]
+    for iid, kind, name, mod, oredict, producers, uses in con.execute(
+            "SELECT id, kind, name, mod, oredict, producers, uses FROM items WHERE kind IN ('item', 'fluid') "
+            "AND (producers > 0 OR uses > 0 OR id IN (SELECT item_id FROM machines)) ORDER BY id"):
+        mk = sorted(made.get(iid, []), key=lambda x: (-x[1], x[0] or ""))
+        us = sorted(used.get(iid, []), key=lambda x: (-x[1], x[0] or ""))
+        mc = machines.get(iid)
+        if not mk and not us and not mc:
+            continue                        # only recycling recipes touch it
+        lines = ["%s %s%s." % ("Fluid" if kind == "fluid" else "Item", iid, " from %s" % mod if mod else "")]
+        ores = json.loads(oredict) if oredict else []
+        if ores:
+            lines.append("Ore dictionary: %s." % ", ".join(ores[:8]))
+        meta = {"item_ids": [iid]}
+        if mc:
+            maps_run = sorted({m[0] for m in mc if m[0]})
+            cls = mc[0][1]
+            tier = next((m[3] for m in mc if m[3] is not None), None)
+            path = class_source(ctx, cls, classes)
+            lines.append("Machine: %s%s; runs %s recipes. Java class %s%s." % (
+                "multiblock" if any(m[2] for m in mc) else "single block",
+                " (%s)" % tiers[tier] if tier is not None and 0 <= tier < len(tiers) else "",
+                ", ".join(maps_run[:4]), cls, ", source %s" % path if path else ""))
+            if path:
+                meta["path"] = path
+        if mk:
+            lines.append("Made by %d recipes: %s." % (sum(x[1] for x in mk), fmt_count_list(mk)))
+        elif not mc:
+            lines.append("No recipe makes it (mined, gathered, dropped or looted).")
+        if recycled.get(iid):
+            lines.append("Also recovered by %d recycling recipes." % recycled[iid])
+        if us:
+            lines.append("Used in %d recipes: %s." % (sum(x[1] for x in us), fmt_count_list(us)))
+            out = [names.get(d, d) for _, d in sorted(makes.get(iid, []), key=lambda x: (-x[0], x[1]))[:10]]
+            if out:
+                lines.append("Used to make: %s." % ", ".join(dict.fromkeys(out)))
+        if mod:
+            meta["mod"] = mod
+        yield {"key": "item:%s" % iid, "title": name or iid, "text": "\n".join(lines), "meta": meta}
+
+
+# code: real upstream source of the core mods, at the exact refs the pack ships (gtnh-src/source/, from tools/decomp/),
+# one chunk per class member (GregGuns' Java chunker). Main sources only; generated structure strings, recipe
+# registration tables, GUI and rendering code are left out (the recipe database answers recipes, and players don't
+# ask about rendering). Read live from gtnh-src at build time (not cached into the corpus: the image has gtnh-src), and
+# only index.py builds it: the server never refreshes the code index in the background.
+
+CODE_REPOS = ("GT5-Unofficial", "GTNHLib", "Applied-Energistics-2-Unofficial", "GregGuns", "TrainHorizons")
+CODE_SKIP = re.compile(r"/client/|/gui/|/render/|/loaders/postload/recipes/|/loaders/materials/|StructureString")
+CODE_MAX_FILE = 150_000
+
+
+def code_repos():
+    env = os.environ.get("GTNH_SEARCH_CODE_REPOS")
+    return tuple(r.strip() for r in env.split(",") if r.strip()) if env else CODE_REPOS
+
+
+def code_files(ctx):
+    """(repo, path) of every Java file the code index covers."""
+    out = []
+    for repo in code_repos():
+        base = ctx.gtnh_src / "source" / repo / "src" / "main" / "java"
+        if not base.is_dir():
+            continue
+        for f in sorted(base.rglob("*.java")):
+            rel = "/" + f.relative_to(base).as_posix()
+            try:
+                big = f.stat().st_size > CODE_MAX_FILE
+            except OSError:
+                continue
+            if not big and not CODE_SKIP.search(rel):
+                out.append((repo, f))
+    return out
+
+
+@source("code", lambda ctx: [], cache=False, doc="Real source of the core mods (gtnh-src/source/), by class member.")
+def discover_code(ctx):
+    for repo, f in code_files(ctx):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = f.relative_to(ctx.gtnh_src).as_posix()
+        yield {"key": "code:%s" % rel, "title": "%s %s" % (repo, f.stem), "text": text,
+               "meta": {"path": "gtnh-src/" + rel, "mod": repo}}
+
+
+def java_boundaries(text):
+    """Line indexes after which a member of a top-level type ends (depth back to 1 at ';' or '}')."""
+    ends, depth, paren, i, line, n = [], 0, 0, 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            line += text.count("\n", i, j)
+            i = j
+            continue
+        elif text.startswith('"""', i):
+            j = text.find('"""', i + 3)
+            j = n if j < 0 else j + 3
+            line += text.count("\n", i, j)
+            i = j
+            continue
+        elif c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        elif c == "(":
+            paren += 1
+        elif c == ")":
+            paren = max(0, paren - 1)
+        elif c == "{":
+            depth += 1
+            if depth == 1:
+                ends.append(line)
+        elif c == "}":
+            depth = max(0, depth - 1)
+            if depth <= 1 and paren == 0:
+                ends.append(line)
+        elif c == ";" and depth == 1 and paren == 0:
+            ends.append(line)
+        i += 1
+    return sorted(set(ends))
+
+
+TYPE_DECL = re.compile(r"^[ \t]*(?:(?:public|protected|private|abstract|static|final|strictfp|sealed)\s+)*"
+                       r"(class|interface|enum|record|@interface)\s+(\w+)", re.M)
+
+
+def member_signature(lines):
+    for raw in lines:
+        t = raw.strip()
+        if not t or t.startswith(("//", "/*", "*", "@", "import ", "package ")) or t in "{}":
+            continue
+        return t.rstrip("{").strip()[:120]
+    return ""
+
+
+def java_spans(text, name):
+    """(start, end, title) per member of the file's top-level type; the title is 'Type: signature'."""
+    lines = text.split("\n")
+    m = TYPE_DECL.search(text)
+    type_name = m.group(2) if m else name
+    spans, start = [], 0
+    for end_line in java_boundaries(text):
+        if end_line + 1 > start:
+            spans.append((start, end_line + 1))
+            start = end_line + 1
+    if start < len(lines):
+        spans.append((start, len(lines)))
+    out = []
+    for a, b in spans:
+        sig = member_signature(lines[a:b])
+        out.append((a, b, type_name + (": " + sig if sig else "")))
+    return out
+
+
+def member_groups(lines, spans):
+    """Small spans (the package and imports, fields, short members) join the next member of a useful size and take
+    its title, so a chunk is named after the method it holds, not the class header; trailing small spans join the last
+    group."""
+    out, pending = [], None
+    for a, b, title in spans:
+        size = sum(len(l) + 1 for l in lines[a:b])
+        start = pending if pending is not None else a
+        if size >= MIN_CHARS:
+            out.append((start, b, title))
+            pending = None
+        elif pending is None:
+            pending = a
+    if pending is not None:
+        if out:
+            out[-1] = (out[-1][0], spans[-1][1], out[-1][2])
+        else:
+            out.append((pending, spans[-1][1], spans[0][2]))
+    return out
+
+
+def chunk_java(kind, doc):
+    name = doc["title"].rsplit(" ", 1)[-1]
+    lines = doc["text"].split("\n")
+    return finish(kind, dict(doc, title=doc["meta"].get("mod", "")), lines,
+                  member_groups(lines, java_spans(doc["text"], name)))
+
+
+SOURCES["code"].chunk = chunk_java
 
 
 # playbook and memory: Dave's own Markdown memories under data/memory/, one file per memory with a frontmatter block.
@@ -1666,9 +1946,10 @@ def count_by_kind(chunks):
     return out
 
 
-def build(ctx, embedder, path, profile=DEFAULT_PROFILE, chunks=None, log=lambda s: None):
+def build(ctx, embedder, path, profile=DEFAULT_PROFILE, chunks=None, log=lambda s: None, extracted=None):
     """Re-chunks the corpus and embeds only chunks whose text changed. Returns the new index, or None when another
-    build holds the lock or the index is read-only."""
+    build holds the lock or the index is read-only. Given chunks, `extracted` says which packs their docs came from
+    (ctx.extracted of the corpus_chunks call that made them)."""
     if not ctx.writable():
         log("index directory is read-only; build skipped")
         return None
@@ -1689,7 +1970,7 @@ def build(ctx, embedder, path, profile=DEFAULT_PROFILE, chunks=None, log=lambda 
         if saved:
             log("resuming with %d vectors from %s" % (len(saved), partial_path(path).name))
         known.update(saved)
-        extracted = {}
+        extracted = dict(extracted or {})
         if chunks is None:
             chunks = corpus_chunks(ctx, PROFILES[profile]["kinds"], log)
             extracted = ctx.extracted  # which packs each kind's docs came from (only known for chunks built here)
@@ -1776,7 +2057,7 @@ def format_hits(hits, snippet=SNIPPET_CHARS):
         text = h["text"]
         if len(text) > snippet:
             text = text[:snippet].rstrip() + "\n[… truncated]"
-        loc = h["source"] + (":%d-%d" % (h["start"], h["end"]) if h["kind"] in ("lang", "wiki", "guide") else "")
+        loc = h["source"] + (":%d-%d" % (h["start"], h["end"]) if h["kind"] in ("lang", "wiki", "guide", "code") else "")
         meta = h.get("meta") or {}
         local = " · locally edited %s" % meta["edited_by_dave"] if meta.get("edited_by_dave") else ""
         head = "[%d] %s · %s · score %.3f%s\n    %s" % (n, h["kind"], h["title"], h["score"], local, loc)

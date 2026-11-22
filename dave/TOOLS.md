@@ -34,7 +34,7 @@ checked result (ANSWER / CHAIN / TOTALS / RUNNER-UP / ...) that Dave turns into 
 
 | Field | Value |
 |---|---|
-| `tools` | Read, Grep, Glob, `gtnh_search`, `wiki_get` (living-wiki, read-only), `memory_recall`, `memory_get`, `player_get` (memory read-only), `query_run` and `query_list` (bridge), the `recipes` tools (`recipe_producers`, `recipe_uses`, `recipe_get`, `item_find`, `plan_chain`) and every `planner` tool. Tools of MCP servers that aren't registered are dropped at render time |
+| `tools` | Read, Grep, Glob, `gtnh_search`, `wiki_get` (living-wiki, read-only), `memory_recall`, `memory_get`, `player_get` (memory read-only), `query_run` and `query_list` (bridge), the `recipes` tools (`recipe_producers`, `recipe_uses`, `recipe_get`, `item_find`, `plan_chain`, `item_cost`) and every `planner` tool. Tools of MCP servers that aren't registered are dropped at render time |
 | `maxTurns` | 40 |
 | `omitClaudeMd` | true (on top of the global CLAUDE.md shutdown) |
 
@@ -79,13 +79,23 @@ Python functions the daemon calls to build the envelope (see `ENVELOPE.md`).
 ## MCP: `gtnh-search` (live; `tools/gtnh-search/`)
 
 `tools/gtnh-search/server.py`. Semantic search over quests, GuideNH, the wiki mirror, item cards, lang,
-`playbook` (from `data/memory/playbook/`) and `memory` (server facts and lessons).
+`playbook` (from `data/memory/playbook/`) and `memory` (server facts and lessons), plus a separate `code` index.
 
 | Tool | Does |
 |---|---|
-| `gtnh_search(query, k=8, kind="any")` | Resolve fuzzy names, find prose. `kind`: `quest`, `guide`, `wiki`, `item`, `lang`, `playbook`, `memory`. Returns item ids for the recipe tools |
+| `gtnh_search(query, k=8, kind="any")` | Resolve fuzzy names, find prose. `kind`: `quest`, `guide`, `wiki`, `item`, `lang`, `playbook`, `memory`, `code`. Returns item ids for the recipe tools |
 | `gtnh_search_status()` | Index state |
 | `gtnh_reindex()` | Incremental refresh (only changed passages are embedded), e.g. after a playbook save |
+
+- **Item cards** (`kind="item"`): one per item or fluid in the recipe database (about 54,000): id, mod, ore
+  dictionary names, the machines that make and use it with counts and lowest tier, what it is used to make, and for
+  a machine block the recipe maps it runs, its Java class and its source file in `gtnh-src/` (`path:` in the hit).
+  A mixed search gives item cards at most a third of the hits.
+- **Code** (`kind="code"`): the core mods' real upstream source in `gtnh-src/source/` (GT5-Unofficial with GT++,
+  BartWorks and the rest merged, GTNHLib, AE2, GregGuns; TrainHorizons once the pack has it), one chunk per class
+  member, embedded with a code model (`voyageai/voyage-code-4`) in its own index. Tests, GUI and rendering code,
+  recipe-registration tables and generated structure strings are left out. Never part of `kind="any"`; built only by
+  `index.py --profile code` (the server never refreshes it), and stamped as the `code-index` pack component.
 
 Environment passed by `mcp.json`: `GTNH_SEARCH_ROOT`, `GTNH_SEARCH_DATA`, `GTNH_SEARCH_INDEX_DIR`,
 `GTNH_MEMORY_DIR` (its own names), plus `OPENROUTER_API_KEY_FILE`. The key itself is never in Claude's
@@ -121,7 +131,9 @@ e.g. `/dave/ro/recipes.sqlite`); a rebuilt file is picked up between calls. Stan
 other four tools still work and `plan_chain` says what is missing. In dev, run `dave_cmd.py` with a Python that has
 highspy (the MCP servers use `sys.executable`). Durations and total EU are **as our server runs them**: GTNHRates sets
 every GT recipe to `ceil(stock ticks / 64)` and leaves EU/t alone, so wiki and NEI-on-stock figures are 64 times
-longer. Its furnace, coke oven and yield boosts are not in the database.
+longer. Its furnace, coke oven and yield boosts are not in the database. The database also keeps GregTech's own
+`OverclockCalculator` results for every GT recipe at every tier and coil (`recipe_oc`, computed by the exporter in our
+server, so with these durations) and the item-cost pass (`item_costs`, `tools/recipes/item_costs.py`).
 
 | Tool | Does |
 |---|---|
@@ -129,10 +141,11 @@ longer. Its furnace, coke oven and yield boosts are not in the database.
 | `recipe_uses(item, ...)` | Recipes that consume or need it, same format |
 | `recipe_get(id)` | One recipe by its `#hash` (a content hash that includes the ticks: stable across exports of the same pack and rates config), with its raw GT metadata and the machines that run its map |
 | `item_find(name, k, kind?)` | FTS5 name search: ids, kinds, mods, ore dictionary names, producer and use counts |
-| `plan_chain(target, rate?, tier?, heat?, cleanroom?, lowgrav?, locks?, free?, banned?, max_depth?, runner_up?)` | LP optimum (HiGHS, lexicographic: EU per item with raw resources priced by class, raw cost, machines, flow): chosen recipes with runs/s and machine counts, EU/t, EU per item, imports, byproducts, the runner-up and why it lost |
+| `plan_chain(target, rate?, tier?, heat?, cleanroom?, lowgrav?, locks?, free?, banned?, max_depth?, runner_up?, oc_tier?, export?)` | LP optimum (HiGHS, lexicographic: EU per item with raw resources priced by class, raw cost, machines, flow): chosen recipes with runs/s, EU/t, EU per item, imports, byproducts, the runner-up and why it lost. Machine counts at base speed and overclocked at `oc_tier` (default `tier`; `"none"` for base only): each GT step on the map's single block (else GregTech's own multiblock) at that tier, with GregTech's own overclocked duration and EU/t, the coils the player's `heat` allows (else the usual ones for the tier), and a multiblock's sub-tick parallels; an `OVERCLOCKED at <tier>` totals line. A multiblock's own parallels and speed bonuses (most GT++ machines) are not counted. Routes are still ranked at base speed. `export: true` appends `PLANNER-CHAIN: {json}` for the planner's `plan_add_chain` |
+| `item_cost(item, tier?, limit=5)` | "Best source of X" as one lookup: what one unit (item or 1,000 L) costs to make on its own at a tier, in EU with raw resources priced as `plan_chain` prices them, and the cheapest recipes that make it, ranked, each broken into machine EU and its inputs at their own costs, with what else it makes. Byproducts are not credited (so a cost is never below what `plan_chain` finds, and equal to it when the best chain reuses none). Says when the item can't be made at that tier and from which tier it can. Costs assume the tier's usual EBF coils |
 
 Item ids: `<mod>:<name>[@meta]` (lowercase, meta 0 omitted), `fluid:<name>`, `aspect:<tag>`, `ore:<oredict>`.
-Allowed with `mcp__recipes`; `recipe-planner` gets all five.
+Allowed with `mcp__recipes`; `recipe-planner` gets all six.
 
 ## MCP: `planner` (live when configured; `tools/planner/`)
 
@@ -155,6 +168,7 @@ recipe-planner. The token reaches the server as a file (`PLANNER_API_TOKEN_FILE`
 | `plan_import(snapshot)` | `plans/import` | Draft from a plan snapshot |
 | `plan_import_current(turn?)` | `plans/import` | Draft from the plan attached to this panel ask (`surface_attachment` through the daemon socket) |
 | `plan_add_cards(planId, cards)` | `plans/add-cards` | Cards `{recipeId, machine?, tier?, dials?: {dialId: value}}`; wired by resource automatically |
+| `plan_add_chain(planId, chain, set_target?)` | `recipes/search`, `plans/add-cards`, `plans/set-targets` | Builds a `plan_chain` result (its `PLANNER-CHAIN` JSON, from `export: true`) into the draft: each step is matched to the planner's own recipe by content (machine, EU/t, duration, consumed inputs, outputs; both datasets come from our pack), the matches are added as cards in one batch at the draft's `cardTier`, and the chain's target becomes the draft's target. Returns each step's `recipeId` and `cardId`, and unmatched steps with the nearest candidates |
 | `plan_remove_cards(planId, cardIds)` | `plans/remove-cards` | |
 | `plan_connect(planId, from, to)` / `plan_disconnect(planId, wireId)` | `plans/connect`, `plans/disconnect` | Override the automatic wiring |
 | `plan_set_targets(planId, targets)` | `plans/set-targets` | `[{resource, rate}]`, per second |

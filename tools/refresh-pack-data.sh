@@ -10,10 +10,13 @@
 #
 #   gtnh-src  tools/decomp/tuxmine_extras.py           source for the tuxmine extras (stock GTNH is regenerated
 #                                                       with tools/decomp/ when GTNH itself updates)
-#   recipes   tools/recipe-export/run.sh <pack>         headless export + data/recipes.sqlite (a few minutes, ~6 GB heap)
+#   recipes   tools/recipe-export/run.sh <pack>         headless export + data/recipes.sqlite (a few minutes, ~6 GB heap),
+#                                                       overclock variants and the item-cost pass (RECIPES_PYTHON)
 #             tools/recipes/item_names.py               item names for the corpus, from the recipe database
-#   corpus    tools/gtnh-search/index.py --extract      quest/guide/lang text from GTNH + tuxmine jars (no API calls)
+#   corpus    tools/gtnh-search/index.py --extract      quest/guide/lang text from GTNH + tuxmine jars, item cards from
+#                                                       the recipe database (no API calls)
 #   index     tools/gtnh-search/index.py                embeddings of changed chunks (OpenRouter, OPENROUTER_API_KEY)
+#   code-index tools/gtnh-search/index.py --profile code   embeddings of changed source members in gtnh-src/source
 #
 # Each step stamps its component (data/packstate/<component>.json) only when it succeeds; a failure stops the run.
 set -euo pipefail
@@ -30,7 +33,7 @@ for a in "$@"; do
   case "$a" in
     --force) force=1 ;;
     --dry-run) dry=1 ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option $a" >&2; exit 2 ;;
   esac
 done
@@ -47,9 +50,11 @@ python3 -I tools/packstate.py jars --fetch >/dev/null
 pack="$(python3 -I -c 'import json,sys; sys.path.insert(0,"tools"); import packstate; print(packstate.gtnh_pack_dir() or "")')"
 [[ -n "$pack" ]] || { echo "no extracted GTNH pack (.work/gtnh-*/pack or GTNH_PACK_DIR)" >&2; exit 1; }
 
+resrc=0
 if stale gtnh-src; then
   log "gtnh-src: tuxmine extras"
   python3 -I tools/decomp/tuxmine_extras.py
+  resrc=1
 fi
 
 reextract=0
@@ -73,7 +78,13 @@ fi
 
 if [[ $reembed == 1 ]] || stale index; then
   log "index: embed changed chunks"
-  python3 -I tools/gtnh-search/index.py
+  python3 -I tools/gtnh-search/index.py --max-usd 5
+fi
+
+# A full first build of the code index costs about $1.50 of embeddings; after that only changed members are embedded.
+if [[ $resrc == 1 ]] || stale code-index; then
+  log "code-index: embed changed source members"
+  python3 -I tools/gtnh-search/index.py --profile code --yes
 fi
 
 python3 -I tools/packstate.py check

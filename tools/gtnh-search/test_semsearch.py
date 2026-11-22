@@ -407,6 +407,131 @@ class IndexTest(unittest.TestCase):
         self.assertEqual([h["source"] for h in only], ["lang:a", "lang:a", "lang:b"])
 
 
+def recipes_db(f):
+    """The recipe tools' sample export (a cut of a real one) built into the fixture's data/recipes.sqlite."""
+    import importlib.util
+    rdir = Path(HERE).parent / "recipes"
+    sys.path.insert(0, str(rdir))
+    spec = importlib.util.spec_from_file_location("dave_build_db", rdir / "build_db.py")
+    bdb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bdb)
+    bdb.log = lambda m: None
+    db = f.root / "data" / "recipes.sqlite"
+    bdb.build(json.loads((rdir / "testdata" / "oracle-sample.json").read_text(encoding="utf-8")), db)
+    return db
+
+
+EBF_CLASS = "gregtech/common/tileentities/machines/multi/MTEElectricBlastFurnace.java"
+OC_SOURCE = """package gregtech.api.util;
+
+/** Overclocks. */
+public class OverclockCalculator {
+
+    protected int machineHeat = 0;
+
+    /**
+     * Heat above the recipe requirement. Never negative, so a colder machine gets no heat bonus or penalty. The heat
+     * surplus decides how many perfect overclocks the furnace gets (one per 1800 K) and how big its EU discount is
+     * (five percent per 900 K), so this one number drives the electric blast furnace's whole coil progression and
+     * every multiblock that copies its rules.
+     */
+    private int getHeatSurplus() {
+        return Math.max(0, machineHeat - recipeHeat);
+    }
+
+    public double calculateHeatDiscountMultiplier() {
+        int heatDiscounts = heatDiscount ? getHeatSurplus() / HEAT_DISCOUNT_THRESHOLD : 0;
+        return GTUtility.powInt(heatDiscountExponent, heatDiscounts);
+    }
+}
+"""
+
+
+class ItemCardTest(unittest.TestCase):
+    def test_cards_from_the_recipe_database(self):
+        with Fixture() as f:
+            recipes_db(f)
+            f.write(f.root / "gtnh-src" / "source" / "GT5-Unofficial" / "src" / "main" / "java" / EBF_CLASS, "class X {}\n")
+            docs = {d["key"]: d for d in s.load_docs(f.ctx, "item")}
+            n2 = docs["item:fluid:nitrogen"]
+            self.assertEqual(n2["title"], "Nitrogen")
+            self.assertEqual(n2["meta"]["item_ids"], ["fluid:nitrogen"])
+            self.assertIn("Fluid fluid:nitrogen.", n2["text"])
+            self.assertRegex(n2["text"], r"Made by \d+ recipes: .*Multiblock Centrifuge \(\d+")
+            steel = docs["item:gregtech:gt.metaitem.01@11305"]
+            self.assertIn("Ore dictionary: ingotSteel", steel["text"])
+            self.assertRegex(steel["text"], r"Blast Furnace \(\d+, from MV\)")
+            ebf = next(d for d in docs.values() if "MTEElectricBlastFurnace" in d["text"])
+            self.assertIn("Machine: multiblock; runs Blast Furnace recipes", ebf["text"])
+            self.assertEqual(ebf["meta"]["path"], "gtnh-src/source/GT5-Unofficial/src/main/java/" + EBF_CLASS)
+            # one chunk per card; cached with the packs it came from, like the other pack kinds
+            self.assertEqual(len(s.SOURCES["item"].chunk("item", n2)), 1)
+            header, cached = s.read_jsonl(f.ctx.corpus / "item" / "docs.jsonl")
+            self.assertEqual(len(cached), len(docs))
+            self.assertIn("item", s.pack_kinds())
+
+    def test_mixed_search_caps_item_cards(self):
+        """Item cards are many and short; in a mixed search they get at most a third of the hits."""
+        with Fixture() as f:
+            recipes_db(f)
+            index = s.build(f.ctx, FakeEmbedder(), s.index_path(f.ctx))
+            self.assertGreater(index["meta"]["kinds"]["item"], 50)
+            hits = s.search(index, FakeEmbedder.vec("Nitrogen fluid made by centrifuge item card"), k=9)
+            self.assertLessEqual(sum(h["kind"] == "item" for h in hits), 3)
+            only = s.search(index, FakeEmbedder.vec("Nitrogen fluid made by centrifuge"), k=5, kind="item")
+            self.assertEqual(len(only), 5)
+
+
+class CodeIndexTest(unittest.TestCase):
+    def fixture(self, f):
+        base = f.root / "gtnh-src" / "source" / "GT5-Unofficial" / "src" / "main" / "java"
+        f.write(base / "gregtech" / "api" / "util" / "OverclockCalculator.java", OC_SOURCE)
+        f.write(base / "gregtech" / "client" / "Render.java", "class Render { void draw() {} }\n")
+        f.write(base / "gregtech" / "loaders" / "postload" / "recipes" / "Big.java", "class Big {}\n")
+        f.write(base / "gregtech" / "Huge.java", "class Huge {\n" + "  int x;\n" * 30000 + "}\n")
+        f.write(f.root / "gtnh-src" / "source" / "GT5-Unofficial" / "src" / "test" / "java" / "T.java", "class T {}\n")
+
+    def test_member_chunks_and_skips(self):
+        with Fixture() as f:
+            self.fixture(f)
+            chunks = s.corpus_chunks(f.ctx, ("code",))
+            self.assertEqual({c["source"] for c in chunks},
+                             {"code:source/GT5-Unofficial/src/main/java/gregtech/api/util/OverclockCalculator.java"})
+            titles = [c["title"] for c in chunks]
+            self.assertIn("GT5-Unofficial > OverclockCalculator: private int getHeatSurplus()", titles)
+            self.assertEqual(chunks[0]["meta"]["path"],
+                             "gtnh-src/source/GT5-Unofficial/src/main/java/gregtech/api/util/OverclockCalculator.java")
+            self.assertTrue(all(c["kind"] == "code" for c in chunks))
+
+    def test_java_spans(self):
+        spans = s.java_spans(OC_SOURCE, "OverclockCalculator")
+        titles = [t for _, _, t in spans]
+        self.assertIn("OverclockCalculator: public double calculateHeatDiscountMultiplier()", titles)
+        self.assertIn("OverclockCalculator: protected int machineHeat = 0;", titles)
+
+    def test_server_routes_kind_code(self):
+        with Fixture() as f:
+            self.fixture(f)
+            prose = s.index_path(f.ctx)
+            s.build(f.ctx, FakeEmbedder(), prose)
+            missing = server.Service(f.ctx, FakeEmbedder(), s.index_path(f.ctx, "code"), "code", refresh=False)
+            svc = server.Service(f.ctx, FakeEmbedder(), prose, code=missing)
+            svc.last_refresh = 1e12
+            text, err = svc.call("gtnh_search", {"query": "heat surplus", "kind": "code"})
+            self.assertTrue(err)
+            self.assertIn("grep gtnh-src/source", text)
+            self.assertIn("Code index (kind=code): not built", svc.status())
+            s.build(f.ctx, FakeEmbedder(), s.index_path(f.ctx, "code"), "code")
+            text, err = svc.call("gtnh_search", {"query": "getHeatSurplus machineHeat recipeHeat", "kind": "code", "k": 2})
+            self.assertFalse(err, text)
+            self.assertIn("[1] code · GT5-Unofficial > OverclockCalculator", text)
+            self.assertIn("path: gtnh-src/source/GT5-Unofficial/src/main/java/gregtech/api/util/OverclockCalculator.java", text)
+            text, _ = svc.call("gtnh_search", {"query": "getHeatSurplus machineHeat recipeHeat", "k": 8})
+            self.assertNotIn("· code ·", text)                 # never part of a mixed search
+            self.assertFalse(svc.code.can_refresh())
+            self.assertRegex(svc.status(), r"Code index \(kind=code\): \d+ chunks from 1 files")
+
+
 class ServerTest(unittest.TestCase):
     def test_protocol(self):
         with Fixture() as f:
@@ -420,6 +545,8 @@ class ServerTest(unittest.TestCase):
             self.assertIsNone(server.handle(svc, {"jsonrpc": "2.0", "method": "notifications/initialized"}))
             names = [t["name"] for t in server.handle(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
             self.assertEqual(names, ["gtnh_search", "gtnh_search_status", "gtnh_reindex"])
+            kinds = server.handle(svc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"][0]
+            self.assertIn("code", kinds["inputSchema"]["properties"]["kind"]["enum"])
             res = server.handle(svc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
                 "name": "gtnh_search", "arguments": {"query": "Nitrogen at HV: centrifuge for nitrogen", "k": 2}}})["result"]
             self.assertFalse(res["isError"])

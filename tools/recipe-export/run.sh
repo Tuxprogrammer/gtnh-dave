@@ -27,6 +27,7 @@
 #   RECIPE_EXPORT_WORK   scratch dir               default <root>/.work/recipe-export
 #   RECIPE_EXPORT_OUT    where the JSON lands       default <root>/data/exports/recipes
 #   DAVE_RECIPES_DB      the database to build      default <root>/data/recipes.sqlite
+#   RECIPES_PYTHON       Python with numpy for the item-cost pass (tools/recipes/item_costs.py)  default python3
 #   JAVA                 java binary (17+)          default /usr/lib/jvm/java-25-openjdk/bin/java, else `java`
 #   JAVA_HOME_BUILD      JDK for the Gradle build (default: the JDK of $JAVA if it has javac, else java-25)
 #   RECIPE_EXPORT_MEM    max heap                   default 6G (GTNH 2.9.0 needs about 5-6 GB)
@@ -47,7 +48,7 @@
 #                        (the remote run gets this; it has no tuxmine/ and no packstate.py)
 set -euo pipefail
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [[ $# -eq 1 && "$1" != -h && "$1" != --help ]] || usage
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -156,7 +157,20 @@ import json, sys; i = json.load(open(sys.argv[1])); print("tuxmine-server %s, ex
 build_db() {
   log "building $db"
   python3 -I "$repo/tools/recipes/build_db.py" "$out/oracle-export.json" "$db" --run-info "$out/run-info.json"
+  item_costs
   stamp_recipes
+}
+
+# The item-cost pass (tools/recipes/item_costs.py, needs numpy) adds what each item costs per tier for the item_cost
+# tool. Without numpy it is skipped with a warning: the database works, and item_cost says the pass is missing.
+item_costs() {
+  local py="${RECIPES_PYTHON:-python3}"
+  if ! "$py" -I -c 'import numpy' 2>/dev/null; then
+    log "WARNING: $py has no numpy; item costs not computed (set RECIPES_PYTHON to a Python with tools/recipes/requirements.txt)"
+    return 0
+  fi
+  log "item costs ($py)"
+  "$py" -I "$repo/tools/recipes/item_costs.py" --db "$db"
 }
 
 # ---------------------------------------------------------------- 1. the oracle jar

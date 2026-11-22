@@ -13,7 +13,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-VOLTAGE_NAMES = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV", "UEV", "UIV", "UXV", "OpV", "MAX"]
+VOLTAGE_NAMES = ["ULV", "LV", "MV", "HV", "EV", "IV", "LuV", "ZPM", "UV", "UHV", "UEV", "UIV", "UMV", "UXV", "MAX"]
 VOLTAGES = [8, 32, 128, 512, 2048, 8192, 32768, 131072, 524288, 2097152, 8388608, 33554432, 134217728, 536870912]
 COILS = {  # GregTech heating coils: base heat in kelvin (the EBF adds 100 K per voltage tier above MV)
     "cupronickel": 1801, "kanthal": 2701, "nichrome": 3601, "tpv": 4501, "tpv-alloy": 4501, "hss-g": 5401,
@@ -49,7 +49,7 @@ def parse_tier(value):
     for i, n in enumerate(VOLTAGE_NAMES):
         if n.lower() == s.lower():
             return i
-    raise ValueError("unknown tier %r (use ULV, LV, MV, HV, EV, IV, LuV, ZPM, UV, UHV, ...)" % value)
+    raise ValueError("unknown tier %r (use ULV, LV, MV, HV, EV, IV, LuV, ZPM, UV, UHV, UEV, UIV, UMV, UXV)" % value)
 
 
 def parse_heat(value, tier=None):
@@ -305,3 +305,79 @@ def recipes_touching(con, iid, side, limit=15, offset=0, **filters):
         seen.add(r["id"])
         rows.append(dict(r))
     return rows, total
+
+
+# ---------------------------------------------------------------- item costs (item_costs.py)
+
+REAL_FAKE_MAPS = ("gt.recipe.fakeAssemblylineProcess", "gt.recipe.rockbreaker", "gt.recipe.multiblockrockbreaker",
+                  "gt.recipe.treefarm")
+
+
+def has_costs(con):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE name = 'item_costs'").fetchone() is not None
+
+
+def cost_tiers(con):
+    return [r[0] for r in con.execute("SELECT DISTINCT tier FROM item_costs ORDER BY tier")]
+
+
+def unit_of(iid):
+    """(multiplier, label): costs are stored per item and per litre; shown per item and per 1,000 L."""
+    return (1000.0, "1,000 L") if iid.startswith("fluid:") else (1.0, "item")
+
+
+def cost(con, iid, tier, cache=None):
+    """Cost per unit (item or litre) of an item at a tier, or None when it can't be made there. An ore dictionary
+    slot, item choice or wildcard costs what its cheapest member does."""
+    key = (iid, tier)
+    if cache is not None and key in cache:
+        return cache[key]
+    row = con.execute("SELECT cost FROM item_costs WHERE tier = ? AND item_id = ?", (tier, iid)).fetchone()
+    c = row[0] if row else None
+    if c is None:
+        info = item(con, iid)
+        members = (json.loads(info["members"]) or {}).get("items") if info and info.get("members") else None
+        if members:
+            vals = [r[0] for r in con.execute(
+                "SELECT cost FROM item_costs WHERE tier = ? AND item_id IN (%s)" % ",".join("?" * len(members)),
+                [tier] + list(members))]
+            c = min(vals) if vals else None
+    if cache is not None:
+        cache[key] = c
+    return c
+
+
+def cost_sources(con, iid, tier, heat, limit=5):
+    """The recipes that make iid at a tier, ranked by what one unit costs through each: its machine EU plus its
+    consumed inputs at their own costs, per expected unit of iid (byproducts not credited). Returns dicts with
+    recipe, per_unit, machine, inputs [(item, amount, cost or None)], others [(item, amount)] and missing."""
+    rows = con.execute(
+        "SELECT DISTINCT r.* FROM recipe_io io JOIN recipes r ON r.id = io.recipe_id WHERE io.item_id = ? "
+        "AND io.side = 'out' AND r.recycle = 0 AND r.lowgrav = 0 AND (r.fake = 0 OR r.map IN (%s)) "
+        "AND (r.tier IS NULL OR r.tier <= ?) AND (r.heat IS NULL OR r.heat <= ?) "
+        "AND (r.special IS NULL OR r.special NOT LIKE '%%\"incomplete\": true%%')"
+        % ",".join("?" * len(REAL_FAKE_MAPS)), (iid,) + REAL_FAKE_MAPS + (tier, heat)).fetchall()
+    cache, out = {}, []
+    for r in rows:
+        r = dict(r)
+        io = io_rows(con, r["id"])
+        made = sum(x["amount"] * x["chance"] for x in io if x["side"] == "out" and x["item_id"] == iid)
+        consumed = [x for x in io if x["side"] == "in" and x["consumed"]]
+        if made <= 0 or (r["eut"] <= 0 and not consumed):
+            continue
+        eu = max(0, r["eut"]) * r["ticks"]
+        inputs, total, missing = [], float(eu), []
+        for x in consumed:
+            amt = x["amount"] * x["chance"]
+            c = cost(con, x["item_id"], tier, cache)
+            inputs.append((x["item_id"], amt, c))
+            if c is None:
+                missing.append(x["item_id"])
+            else:
+                total += amt * c
+        others = [(x["item_id"], x["amount"] * x["chance"]) for x in io if x["side"] == "out" and x["item_id"] != iid]
+        out.append({"recipe": r, "per_unit": None if missing else total / made, "machine": eu / made,
+                    "inputs": inputs, "others": others, "missing": missing, "made": made})
+    out.sort(key=lambda s: (s["per_unit"] is None, s["per_unit"] if s["per_unit"] is not None else 0,
+                            s["recipe"]["ticks"]))
+    return out[:limit], len(out)

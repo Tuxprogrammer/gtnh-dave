@@ -4,7 +4,9 @@ recipes without the 300+ MB file.
     python3 -I tools/recipes/testdata/make_sample.py <oracle-export.json> [out.json]
 
 It keeps every GregTech recipe that touches one of KEEP (nitrogen and air, steel, the NAND and NOR chip lines), with
-the catalysts of their maps, a few crafting, furnace and Thaumcraft recipes, and a few ore dictionary entries.
+the catalysts of their maps, a few crafting, furnace and Thaumcraft recipes, and a few ore dictionary entries. GT
+recipes keep their overclock variants (runtimeCalculation, up to UXV). The current fixture is cut from the stock-rate
+export of 2026-11-01 (before GTNHRates was in the server pack), so its durations are GregTech's stock ones.
 """
 
 import json
@@ -35,7 +37,12 @@ def touches(r):
 
 def strip(o):
     if isinstance(o, dict):
-        return {k: strip(v) for k, v in o.items() if k not in ("runtimeCalculation", "neiLayout", "icon", "tooltip")}
+        out = {k: strip(v) for k, v in o.items() if k not in ("runtimeCalculation", "neiLayout", "icon", "tooltip")}
+        rc = o.get("runtimeCalculation")
+        if isinstance(rc, dict):  # GregTech's own overclock results, cut to what build_db.py keeps
+            out["runtimeCalculation"] = {"status": rc.get("status"), "compactVariants": [
+                v for v in rc.get("compactVariants") or [] if v[0] <= 13]}
+        return out
     if isinstance(o, list):
         return [strip(v) for v in o]
     return o

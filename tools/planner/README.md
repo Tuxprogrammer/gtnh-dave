@@ -3,7 +3,7 @@
 `server.py` is a stdio MCP server (standard library only, run with `python3 -I`) that gives Dave the agent API of a
 self-hosted GTNH planner website: recipe lookups in the planner's own dataset, and plans (drafts) built and solved on
 the site for a player, then delivered as a new plan they open in game. One tool per endpoint, plus
-`plan_import_current`. The tool list is in [`dave/TOOLS.md`](../../dave/TOOLS.md#mcp-planner-live-when-configured-toolsplanner).
+`plan_import_current` and `plan_add_chain`. The tool list is in [`dave/TOOLS.md`](../../dave/TOOLS.md#mcp-planner-live-when-configured-toolsplanner).
 
 API spec: <https://github.com/Tuxprogrammer/gtnh-factory-flow/blob/main/docs/agent-api.md>. The site answers a bare
 404 on `/api/agent/` until its `AGENT_API_TOKEN` is set, and every endpoint the spec marks "not yet built" answers a
@@ -45,6 +45,16 @@ otherwise says why it was left out.
   `surface_attachment`, as the `bridge` tool of that name does), reads the JSON file and posts it as
   `{snapshot, player?}` to `plans/import`. The answer is the site's (`planId`) plus `attachment` (turn, surface,
   bytes, and `earlier: true` when it is the asker's earlier ask's).
+- `plan_add_chain(planId, chain, set_target?)` builds a chain from the recipes server's `plan_chain` (called with
+  `export: true`; `chain` is the JSON after `PLANNER-CHAIN: `) into a draft, so Dave's own optimizer and the site's
+  solver work on the same chain. For each step it searches the site (`recipes/search`: `makes` plus the step's machine
+  and first input, then looser) and takes the recipe whose EU/t, duration (within a tick), outputs and consumed
+  inputs are the step's (`chain_match`; ore dictionary slots are not compared, and an "any of" slot matches by its
+  alternatives). Both datasets are exported from our pack, so a step normally matches exactly. The matched recipes go
+  in as cards in one `plans/add-cards` call at the draft's `cardTier` (one by one if the site refuses the batch, so
+  one bad card doesn't lose the rest), then `plans/set-targets` gets the chain's target. The answer lists each
+  step's `recipeId` and `cardId`, and each unmatched step with up to three near candidates and what differs. At
+  most 40 steps; searches run four at a time.
 - Answers come back as compact JSON. One over 16,000 characters (above the site's own 12 KB aim) is cut, with a first line that says so and suggests
   a smaller `limit`.
 - Errors: the site's `{"error": {"code", "message"}}` becomes `planner error <code>: <message>`; a bare 404 becomes

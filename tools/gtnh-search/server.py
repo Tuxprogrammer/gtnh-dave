@@ -24,7 +24,11 @@ INSTRUCTIONS = (
     "Semantic search over GT New Horizons 2.9 knowledge: the quest book (one hit per quest, with its quest line, "
     "tasks, rewards and prerequisites), GuideNH guide pages (machines, multiblocks, power, AE2, Thaumcraft), the "
     "en_US.lang player text of every mod (item and machine names, tooltips, structure hints), the offline GTNH wiki "
-    "when it has been mirrored, and your own saved answers (playbook) and server notes (memory). Use gtnh_search "
+    "when it has been mirrored, item cards (every item and fluid: id, ore dictionary names, what makes it and what "
+    "it is used in; a machine's card names its Java class and source file), and your own saved answers (playbook) "
+    "and server notes (memory). kind='code' searches a separate index of the core mods' real source by class "
+    "member (GregTech with GT++, BartWorks and the rest merged, GTNHLib, AE2, GregGuns): use it for how a mechanic "
+    "works in code ('where is the coil heat discount applied'); grep gtnh-src for exact names. Use gtnh_search "
     "first to turn a player's loose wording ('liquid air', 'N2', 'that blue circuit') into real item names and IDs, "
     "and to find written advice: which quest covers a machine, what a multiblock needs, how a mechanic works. "
     "Search resolves names and finds prose; it never decides which recipes exist. Exact recipe facts (inputs, "
@@ -53,8 +57,10 @@ TOOLS = [
                 "k": {"type": "integer", "minimum": 1, "maximum": 25, "default": 8, "description": "Number of hits."},
                 "kind": {"type": "string", "enum": KIND_ENUM, "default": "any",
                          "description": "Restrict to one source: quest (quest book), guide (GuideNH pages), wiki, "
-                                        "item (item cards), lang (item names and tooltips), playbook (saved answers), "
-                                        "memory (server notes and lessons)."},
+                                        "item (item cards: ids, what makes and uses an item, a machine's class and "
+                                        "source file), lang (item names and tooltips), playbook (saved answers), "
+                                        "memory (server notes and lessons), code (the core mods' real source, by "
+                                        "class member; never part of 'any')."},
             },
             "required": ["query"],
         },
@@ -78,8 +84,11 @@ def log(msg):
 
 
 class Service:
-    def __init__(self, ctx, embedder, path, profile=s.DEFAULT_PROFILE):
+    def __init__(self, ctx, embedder, path, profile=s.DEFAULT_PROFILE, refresh=True, code=None):
         self.ctx, self.embedder, self.path, self.profile = ctx, embedder, path, profile
+        # The code index is built only by index.py (from gtnh-src); a server never refreshes it.
+        self.allow_refresh = refresh
+        self.code = code
         self.mtime = self.file_mtime()
         self.index = s.read_index(path, log)
         self.lock = threading.Lock()
@@ -111,7 +120,7 @@ class Service:
         return True
 
     def can_refresh(self):
-        return self.embedder is not None and self.ctx.writable()
+        return self.allow_refresh and self.embedder is not None and self.ctx.writable()
 
     def start_refresh(self):
         """Starts a refresh thread and returns it, or None when one is running or refreshing is off."""
@@ -168,10 +177,28 @@ class Service:
             lines.append("OPENROUTER_API_KEY is not set (environment or .env at the repository root); search is unavailable.")
         if self.last_error:
             lines.append("Last refresh error: " + self.last_error)
+        if self.code is not None:
+            ci = self.code.index
+            lines.append("Code index (kind=code): %s" % (
+                "%d chunks from %d files, model %s, built %s" % (
+                    ci["meta"]["chunks"], ci["meta"]["sources"], ci["meta"]["model"],
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(ci["meta"]["built_at"]))) if ci else
+                "not built (tools/gtnh-search/index.py --profile code)"))
         return "\n".join(lines)
+
+    def code_search(self, query, k):
+        c = self.code
+        if c is None or c.index is None:
+            return ("The code index is not built here; grep gtnh-src/source for exact names instead "
+                    "(tools/gtnh-search/index.py --profile code builds it)."), True
+        if c.embedder is None:
+            return self.status(), True
+        return s.format_hits(s.search(c.index, c.embedder.query(query), k, "code")), False
 
     def call(self, name, args):
         self.maybe_reload()
+        if self.code is not None:
+            self.code.maybe_reload()
         if name == "gtnh_search_status":
             return self.status(), False
         if name == "gtnh_reindex":
@@ -187,6 +214,9 @@ class Service:
             query = (args.get("query") or "").strip()
             if not query:
                 return "query is required", True
+            k = max(1, min(25, int(args.get("k") or 8)))
+            if (args.get("kind") or "any") == "code":
+                return self.code_search(query, k)
             if self.embedder is None:
                 return self.status(), True
             if self.index is None:
@@ -194,7 +224,6 @@ class Service:
                     return "The index is being built for the first time (a few minutes). Try again shortly.", True
                 return self.status(), True
             self.refresh_in_background()
-            k = max(1, min(25, int(args.get("k") or 8)))
             kind = args.get("kind") or "any"
             if kind not in KIND_ENUM:
                 return "kind must be one of: " + ", ".join(KIND_ENUM), True
@@ -281,7 +310,11 @@ def main(argv=None):
         s.seed(ctx, log=log)
     key = s.load_key(ctx.root)
     model = s.PROFILES[profile]["model"]
-    service = Service(ctx, s.OpenRouter(key, model) if key else None, s.index_path(ctx, profile), profile)
+    code = None
+    if profile == s.DEFAULT_PROFILE and "code" in s.PROFILES:
+        cm = s.PROFILES["code"]["model"]
+        code = Service(ctx, s.OpenRouter(key, cm) if key else None, s.index_path(ctx, "code"), "code", refresh=False)
+    service = Service(ctx, s.OpenRouter(key, model) if key else None, s.index_path(ctx, profile), profile, code=code)
     service.start_refresh()
     serve(service, sys.stdin, sys.stdout)
 

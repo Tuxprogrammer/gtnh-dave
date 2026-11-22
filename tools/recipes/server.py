@@ -29,7 +29,9 @@ INSTRUCTIONS = (
     "whenever you quote a recipe; never guess one. Item arguments take an id from item_find or gtnh_search "
     "(gregtech:gt.metaitem.01@11305, fluid:nitrogen) or an exact in-game name. Recipe ids (#hash) are stable for this "
     "pack version. plan_chain picks the best chain (least EU per item, then cheapest raw resources, then fewest "
-    "machines) with locks, free inputs and bans, and gives the runner-up and why it lost."
+    "machines) with locks, free inputs and bans, gives the runner-up and why it lost, and counts machines both at "
+    "base speed and overclocked at the player's tier. item_cost answers 'what's the best source of X' as a ranked "
+    "lookup: what one unit costs at a tier and the cheapest recipes that make it, each with its cost broken down."
 )
 
 ITEM = {"type": "string", "description": "Item or fluid: an id (gregtech:gt.metaitem.03@32075, fluid:nitrogen) or "
@@ -102,8 +104,29 @@ TOOLS = [
             "banned": {"type": "array", "items": {"type": "string"},
                        "description": "Recipe #hashes, machines, mods ('Thaumcraft') or items (no import)."},
             "max_depth": {"type": "integer", "minimum": 1, "maximum": 15, "default": 8},
-            "runner_up": {"type": "boolean", "default": True}},
+            "runner_up": {"type": "boolean", "default": True},
+            "oc_tier": {"type": "string",
+                        "description": "Tier the machines run at for the overclocked counts (GregTech's own "
+                                       "overclock results for this server). Default: tier. 'none' for base speed "
+                                       "only."},
+            "export": {"type": "boolean", "default": False,
+                       "description": "Also return the chain as PLANNER-CHAIN JSON, for the planner tool "
+                                      "plan_add_chain (builds it as cards on the planner site)."}},
             "required": ["target"]},
+    },
+    {
+        "name": "item_cost",
+        "description": "What one unit of an item or fluid costs to make on its own at a voltage tier, in EU (machine "
+                       "EU, with raw resources priced as plan_chain prices them: free 0, cheap 2,000, costly 100,000 "
+                       "per item or 1,000 L), and the cheapest recipes that make it, ranked, each broken down into "
+                       "machine EU and inputs at their own costs. 'Best source of X' as one lookup, and why one "
+                       "route beats another. Byproducts are not credited; for a full chain with byproduct reuse, "
+                       "locks and machine counts use plan_chain.",
+        "inputSchema": {"type": "object", "properties": {
+            "item": ITEM,
+            "tier": {"type": "string", "description": "Player's tier (ULV ... UXV). Default: the highest computed."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 12, "default": 5}},
+            "required": ["item"]},
     },
 ]
 
@@ -195,8 +218,72 @@ class Service:
             return planner.plan_chain(self.con(), a.get("target"), a.get("rate"), a.get("tier"), a.get("heat"),
                                       a.get("cleanroom", True), a.get("lowgrav", False), a.get("locks") or (),
                                       a.get("free") or (), a.get("banned") or (), int(a.get("max_depth") or 8),
-                                      runner_up=a.get("runner_up", True) is not False)
+                                      runner_up=a.get("runner_up", True) is not False, oc_tier=a.get("oc_tier"),
+                                      export=bool(a.get("export")))
+        if name == "item_cost":
+            return self.item_cost(args)
         return "unknown tool: %s" % name, True
+
+    def item_cost(self, args):
+        con = self.con()
+        if not R.has_costs(con):
+            return ("item costs are not in this recipe database (run tools/recipes/item_costs.py on it); use "
+                    "recipe_producers or plan_chain instead"), True
+        iid, err = R.resolve(con, args.get("item"))
+        if err:
+            return err, True
+        tiers = R.cost_tiers(con)
+        tier = R.parse_tier(args.get("tier"))
+        label = R.tier_name(tier) if tier is not None else "any tier (%s)" % R.tier_name(tiers[-1])
+        if tier is None:
+            tier = tiers[-1]
+        elif tier not in tiers:
+            tier = max([t for t in tiers if t <= tier] or [tiers[0]])
+        limit = max(1, min(12, int(args.get("limit") or 5)))
+        names = {}
+        name = R.item_name(con, iid, names)
+        mul, unit = R.unit_of(iid)
+        info = R.meta(con).get("item_costs") or {}
+        heat = (info.get("heat_by_tier") or {}).get(R.tier_name(tier)) or 0
+        row = con.execute("SELECT cost, via, bound FROM item_costs WHERE tier = ? AND item_id = ?",
+                          (tier, iid)).fetchone()
+        if row is None:
+            first = con.execute("SELECT MIN(tier) FROM item_costs WHERE item_id = ?", (iid,)).fetchone()[0]
+            return "%s (%s) can't be made at %s%s." % (
+                name, iid, label, "; it can from %s" % R.tier_name(first) if first is not None else
+                "; no tier up to %s makes it" % R.tier_name(tiers[-1])), False
+        lines = ["%s (%s) at %s: %s EU per %s, made on its own (machine EU plus raw resources priced by class; "
+                 "byproducts not credited)." % (name, iid, label, R.fmt_num(round(row["cost"] * mul, 2)), unit)]
+        raw = con.execute("SELECT class, note FROM raw_resources WHERE item_id = ?", (iid,)).fetchone()
+        if row["bound"]:
+            lines.append("That is its import price: %s." % (
+                "raw resource, %s (%s)" % (raw["class"], raw["note"]) if raw else
+                "nothing makes it" if row["bound"] == "no recipe" else row["bound"]))
+        srcs, total = R.cost_sources(con, iid, tier, heat, limit)
+        if srcs:
+            lines.append("Cheapest recipes that make it at %s (%d in all), per %s:" % (R.tier_name(tier), total, unit))
+        for n, sv in enumerate(srcs, 1):
+            r = sv["recipe"]
+            ins = sorted(sv["inputs"], key=lambda t: -(t[1] * (t[2] or 0)))
+            parts = []
+            for i, amt, c in ins[:4]:
+                each = amt / sv["made"] * mul
+                parts.append("%s %s (%s)" % (R.fmt_amount(i, each), R.item_name(con, i, names),
+                                             "can't be made at this tier" if c is None else
+                                             "%s EU" % R.fmt_num(round(amt * c / sv["made"] * mul, 2))))
+            more = " +%d more" % (len(ins) - 4) if len(ins) > 4 else ""
+            head = "%s EU" % R.fmt_num(round(sv["per_unit"] * mul, 2)) if sv["per_unit"] is not None else \
+                "not possible here"
+            also = ", ".join(R.item_name(con, i, names) for i, _ in sv["others"][:3])
+            lines.append("%d. %s: #%s %s (%s) = machine %s EU + inputs: %s%s%s" % (
+                n, head, r["hash"], r["machine"] or r["map"], R.recipe_flags(r),
+                R.fmt_num(round(sv["machine"] * mul, 2)), "; ".join(parts) or "none", more,
+                (" | also makes " + also + (" ..." if len(sv["others"]) > 3 else "")) if also else ""))
+        if not srcs and not row["bound"]:
+            lines.append("No recipe makes it at this tier.")
+        lines.append("Costs assume the tier's usual EBF coils (%s K at %s), cleanroom yes, no low gravity." % (
+            R.fmt_num(heat), R.tier_name(tier)))
+        return "\n".join(lines), False
 
     def status_line(self):
         try:
