@@ -10,6 +10,8 @@
     "                 must equal the jar version.",
     "      skip       not sourced on purpose; `reason` is required and is printed in the indexes.",
     "Optional: dir (checkout dir name, default: the repo name), name, ours (one of the owner's own mods),",
+    "commit_suffix (git kind: a jar version ending in `+<sha>`, as the GTNH buildscript names untagged builds,",
+    "checks out that commit, which must be on a branch of `repo`, instead of `tag`),",
     "submodules {path: {repo, branch, commit, note}}, bundles [{name, repo, tag, runtimePackage, note}],",
     "decompile {include: [class path prefixes]}, notes, generated [classes the build generates, so they are",
     "not in the source; the generateGradleTokenClass of gradle.properties is detected without this]."
@@ -20,6 +22,7 @@
       "kind": "git",
       "repo": "https://github.com/Tuxprogrammer/GregGuns",
       "tag": "{version}",
+      "commit_suffix": true,
       "ours": true
     },
     {
@@ -27,6 +30,7 @@
       "kind": "git",
       "repo": "https://github.com/Tuxprogrammer/MerryGregmas",
       "tag": "{version}",
+      "commit_suffix": true,
       "name": "Merry Gregmas",
       "ours": true
     },
@@ -35,6 +39,7 @@
       "kind": "git",
       "repo": "https://github.com/Tuxprogrammer/LostCities",
       "tag": "{version}",
+      "commit_suffix": true,
       "ours": true,
       "notes": "Lost Cities: New Horizons, the owner's 1.7.10 port of McJty's Lost Cities."
     },

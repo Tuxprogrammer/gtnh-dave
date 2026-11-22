@@ -25,7 +25,7 @@ Environment: DAVE_AGENT_ROOT, VINEFLOWER_JAR (default: newest <root>/.work/gtnh-
 TUXMINE_EXTRAS_GIT_CREDENTIAL_HELPER (a git credential.helper for private repos, e.g. "!gh auth git-credential"), plus the
 packstate.py variables.
 """
-import fnmatch, hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, time, zipfile
+import fnmatch, hashlib, io, json, os, re, shutil, subprocess, sys, tarfile, tempfile, time, zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -86,6 +86,29 @@ def ls_remote_tag(repo, tag):
     if not sha:
         raise Fail(f"tag {tag!r} does not exist on {repo} (derived from the jar version; fix the mapping's tag "
                    f"template in {CONFIG.name} or check that the release was tagged)")
+    return sha
+
+
+# A jar version ending in "+<sha>" (GTNH buildscript versions of untagged commits, e.g. 0.4.1-beta-master.1+0b38704d44)
+# names the commit that built it; entries with "commit_suffix": true check that commit out instead of a tag.
+COMMIT_SUFFIX = re.compile(r"\+(?P<sha>[0-9a-f]{7,40})$")
+
+
+def resolve_commit(repo, short):
+    """The full id of commit `short` (an abbreviated sha) of `repo`; it must be on one of the repo's branches."""
+    heads = [line.split("\t", 1)[0] for line in git("ls-remote", "--heads", repo).splitlines() if "\t" in line]
+    hits = {h for h in heads if h.startswith(short)}
+    if len(hits) == 1:
+        return hits.pop()
+    with tempfile.TemporaryDirectory(prefix="tuxmine-extras-") as tmp:
+        git("init", "-q", tmp)
+        # Commits only (no trees or blobs): enough to resolve the abbreviation and prove it is on a branch.
+        git("-C", tmp, "fetch", "-q", "--no-tags", "--filter=tree:0", repo, "+refs/heads/*:refs/remotes/origin/*")
+        p = git("-C", tmp, "rev-parse", "-q", "--verify", f"{short}^{{commit}}", check=False, stdout=subprocess.PIPE)
+        sha = p.stdout.decode().strip()
+        if p.returncode != 0 or not sha:
+            raise Fail(f"commit {short} (from the jar version) is on no branch of {repo}, or the abbreviation is "
+                       f"ambiguous")
     return sha
 
 
@@ -441,6 +464,12 @@ def plan(jars, cfg, rows):
                                f"{e.get('verified_version')}, the pack now ships {v}. Find the source for {v} and "
                                f"update the entry.")
                 it.update(ref=e["commit"], refKind="commit", commit=e["commit"], branch=e.get("branch"))
+            elif e.get("commit_suffix") and COMMIT_SUFFIX.search(v):
+                short = COMMIT_SUFFIX.search(v)["sha"]
+                key = (e["repo"], "commit:" + short)
+                if key not in resolved:
+                    resolved[key] = resolve_commit(e["repo"], short)
+                it.update(ref=resolved[key], refKind="commit", commit=resolved[key])
             else:
                 tag = e["tag"].format(version=v)
                 key = (e["repo"], tag)
@@ -738,8 +767,10 @@ def make_rows(root, items):
         else:
             repo_url, ref, ref_kind = e["repo"], it["ref"], it["refKind"]
             date = commit_date(sdir)
-            if ref_kind == "commit":
-                notes = (notes + f" Pinned commit {it['commit'][:12]} on branch {it.get('branch')}.").strip()
+            if ref_kind == "commit" and it.get("branch"):
+                notes = (notes + f" Pinned commit {it['commit'][:12]} on branch {it['branch']}.").strip()
+            elif ref_kind == "commit":
+                notes = (notes + f" Commit {it['commit'][:12]}, named by the jar version's +sha suffix.").strip()
         api = None
         for sub, s in (e.get("submodules") or {}).items():
             slic, _ = detect_license(sdir / sub)

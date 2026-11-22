@@ -19,6 +19,7 @@ import tuxmine_extras as tx  # noqa: E402
 # The jars the packs shipped when the mapping was written: each must match exactly one entry.
 KNOWN_JARS = {
     "gregguns-0.4.0-beta.jar": "0.4.0-beta",
+    "gregguns-0.4.1-beta-master.1+0b38704d44.jar": "0.4.1-beta-master.1+0b38704d44",
     "merrygregmas-0.2.1-beta.jar": "0.2.1-beta",
     "lostcitiesnh-0.4.1-beta.jar": "0.4.1-beta",
     "fortunateone-v1.1.11.jar": "v1.1.11",
@@ -214,6 +215,47 @@ class ReleaseCommitTest(unittest.TestCase):
         self.assertEqual((dest / "f.txt").read_text(), "b")
         self.assertTrue(tx.snapshot_ok(dest, self.release))
         self.assertFalse(tx.snapshot(self.r, "DaveBridge", self.release, dest))
+
+
+class CommitSuffixTest(unittest.TestCase):
+    """A jar version ending in +<sha> resolves to that commit of the repo (no tag needed)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.r = Path(self.tmp.name) / "repo"
+        self.r.mkdir()
+        git(self.r, "init", "-q", "-b", "master")
+        (self.r / "a.txt").write_text("a")
+        git(self.r, "add", "a.txt")
+        git(self.r, "commit", "-q", "-m", "first")
+        self.first = git(self.r, "rev-parse", "HEAD")
+        (self.r / "a.txt").write_text("b")
+        git(self.r, "commit", "-q", "-am", "second")
+        self.head = git(self.r, "rev-parse", "HEAD")
+        self.url = self.r.as_uri()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_suffix_pattern(self):
+        self.assertEqual(tx.COMMIT_SUFFIX.search("0.4.1-beta-master.1+0b38704d44")["sha"], "0b38704d44")
+        self.assertIsNone(tx.COMMIT_SUFFIX.search("0.4.1-beta"))
+        self.assertIsNone(tx.COMMIT_SUFFIX.search("1.0+abc"))          # too short to be a commit
+
+    def test_branch_head(self):
+        self.assertEqual(tx.resolve_commit(self.url, self.head[:10]), self.head)
+
+    def test_older_commit_on_a_branch(self):
+        self.assertEqual(tx.resolve_commit(self.url, self.first[:10]), self.first)
+
+    def test_unknown_commit_fails(self):
+        with self.assertRaises(tx.Fail):
+            tx.resolve_commit(self.url, "0123456789")
+
+    def test_owner_mods_opt_in(self):
+        entries = {e["jar"].split("-(")[0]: e for e in tx.load_config()["mods"]}
+        for mod in ("gregguns", "merrygregmas", "lostcitiesnh"):
+            self.assertTrue(entries[mod].get("commit_suffix"), mod)
 
 
 if __name__ == "__main__":
