@@ -535,6 +535,14 @@ class ImportCurrent(Base):
         self.assertEqual(self.daemon.calls[-1]["args"], {"turn": "t-0123456789"})
         self.assertEqual(self.site.requests[-1]["body"], {"snapshot": self.snapshot})
 
+    def test_earlier_attachment_refused_without_turn(self):
+        self.daemon.reply["result"]["earlier"] = True
+        text, err = self.call("plan_import_current")
+        self.assertTrue(err)
+        self.assertIn("no plan is attached to this ask", text)
+        self.assertIn("t-0123456789", text)
+        self.assertEqual(self.site.requests, [])
+
     def test_no_attachment(self):
         self.daemon.reply = {"ok": False, "error": "Steve has not attached anything"}
         text, err = self.call("plan_import_current")

@@ -215,8 +215,8 @@ IMPORT_CURRENT = {
     "name": "plan_import_current",
     "description": (
         "Import the plan the player attached to this turn's GTNH Planner panel ask as a draft; returns {planId, "
-        "cardCount, wireCount, warnings} and which ask the attachment came from. Then change the draft and use plan_diff for a proposal. turn picks "
-        "another turn's attachment."),
+        "cardCount, wireCount, warnings} and which ask the attachment came from. Then change the draft and use plan_diff for a proposal. An ask "
+        "without an attachment is refused rather than falling back to an older copy; turn picks another turn's attachment on purpose."),
     "inputSchema": schema({"turn": {"type": "string", "description": "A turn id (t-0123456789); default: this "
                                                                      "turn, else the asker's newest."}}),
 }
@@ -472,6 +472,13 @@ class Service:
     def import_current(self, args):
         self.settings()                              # "not configured" before anything else
         meta = self.attachment(args.get("turn"))
+        if meta.get("earlier") and not args.get("turn"):
+            # This ask came without a plan (the panel leaves it out when it is too large). An older copy could name
+            # cards the player has since removed, so it is only used when asked for by turn id.
+            raise PlannerError("no plan is attached to this ask (the panel leaves it out when the plan is too large). "
+                               "Don't work from an older copy: answer in words, or build a new plan (plan_create ... "
+                               "plan_deliver) for the player to open with /gtnhplanner open <id>. Pass turn (%s) only "
+                               "when the player asks for that earlier plan." % meta.get("turn"))
         try:
             with open(meta["path"], encoding="utf-8") as f:
                 snapshot = json.load(f)

@@ -166,7 +166,7 @@ recipe-planner. The token reaches the server as a file (`PLANNER_API_TOKEN_FILE`
 | `recipes_get(recipeId)` | `recipes/get` | One recipe with every machine that runs it and its dials |
 | `plan_create(name, constraints?)` | `plans/create` | Empty draft: `{planId}` |
 | `plan_import(snapshot)` | `plans/import` | Draft from a plan snapshot |
-| `plan_import_current(turn?)` | `plans/import` | Draft from the plan attached to this panel ask (`surface_attachment` through the daemon socket) |
+| `plan_import_current(turn?)` | `plans/import` | Draft from the plan attached to this panel ask (`surface_attachment` through the daemon socket). An ask without one is refused, never filled from an older copy; `turn` picks an earlier ask's plan on purpose |
 | `plan_add_cards(planId, cards)` | `plans/add-cards` | Cards `{recipeId, machine?, tier?, dials?: {dialId: value}}`; wired by resource automatically |
 | `plan_add_chain(planId, chain, set_target?)` | `recipes/search`, `plans/add-cards`, `plans/set-targets` | Builds a `plan_chain` result (its `PLANNER-CHAIN` JSON, from `export: true`) into the draft: each step is matched to the planner's own recipe by content (machine, EU/t, duration, consumed inputs, outputs; both datasets come from our pack), the matches are added as cards in one batch at the draft's `cardTier`, and the chain's target becomes the draft's target. Returns each step's `recipeId` and `cardId`, and unmatched steps with the nearest candidates |
 | `plan_remove_cards(planId, cardIds)` | `plans/remove-cards` | |
