@@ -23,7 +23,7 @@ CALL_WORKERS = 4
 MAX_LIMIT = 40
 
 INSTRUCTIONS = (
-    "Exact recipe facts from this server's own pack export (GTNH 2.9.0 plus our mods, GregGuns included): every "
+    "Exact recipe facts from this server's own pack export (stock GTNH plus our mods, GregGuns included): every "
     "GregTech machine recipe, crafting table, furnace and Thaumcraft recipe, with EU/t, duration, voltage tier, "
     "programmed circuit, cleanroom, low gravity, coil heat, chanced outputs and non-consumed inputs. Use these tools "
     "whenever you quote a recipe; never guess one. Item arguments take an id from item_find or gtnh_search "

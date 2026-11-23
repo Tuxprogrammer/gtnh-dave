@@ -123,7 +123,7 @@ with no "used to" or "(corrected by Dave)". The old claim and why it changed go 
 
 ## MCP: `recipes` (live; `tools/recipes/`, plan in `docs/plans/recipe-knowledge.md`)
 
-`tools/recipes/server.py` over `data/recipes.sqlite`, exported from **our own pack** (stock 2.9.0 plus the
+`tools/recipes/server.py` over `data/recipes.sqlite`, exported from **our own pack** (stock GTNH plus the
 `tuxmine/server` mods, GregGuns included) by `tools/recipe-export/run.sh` and built by `tools/recipes/build_db.py`.
 The database path is `[paths] recipes` / `DAVE_RECIPES_DB` (production: the read-only copy baked into the image,
 e.g. `/dave/ro/recipes.sqlite`); a rebuilt file is picked up between calls. Standard library only, except

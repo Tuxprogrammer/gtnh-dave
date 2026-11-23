@@ -12,7 +12,7 @@
 #   "~" expands to the invoking user's home.
 
 [pack]
-version = "2.9.0"                          # DAVE_PACK_VERSION. Playbook entries from other versions read as stale.
+version = "2.9.1"                          # DAVE_PACK_VERSION. Playbook entries from other versions read as stale.
 
 [model]
 name = "sonnet"                            # DAVE_MODEL. Alias ("sonnet", "opus", "haiku") or a full model id.

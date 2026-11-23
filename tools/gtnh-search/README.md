@@ -2,7 +2,7 @@
 
 Gives Dave a `gtnh_search` tool that searches GT New Horizons knowledge by meaning, not by exact wording. It covers:
 
-- the 2.9.0 quest book: one passage per quest, with its quest line, tasks, rewards and prerequisites;
+- the pack's quest book: one passage per quest, with its quest line, tasks, rewards and prerequisites;
 - the GuideNH guide pages: GregTech machines and multiblocks, power, overclocking, AE2, Thaumcraft;
 - the `en_US.lang` player text of every mod: item and machine names, tooltips, structure hints, including our own extra mods from the tuxmine packs (GregGuns, EZStorage, Lost Cities, Qz-Miner, …);
 - an offline copy of wiki.gtnewhorizons.com, from Miraheze's archive.org backups and refreshed weekly (see [The wiki](#the-wiki));
@@ -22,7 +22,7 @@ The code is ported from GregGuns' `tools/semantic-search` (same owner, itself po
 
   | `kind` | Read from | One document = |
   |---|---|---|
-  | `quest` | `config/betterquesting/DefaultQuests/` in the pack. In 2.9.0 the quest text is inline in each quest's JSON (`name:8`, `desc:8`), not in a lang file. Chapters come from `QuestLines/`. | One quest: quest line, title, description, tasks with item names, rewards, prerequisites and the quests it unlocks. Metadata: `quest_id` (BetterQuesting's base64 ID, as in the file names), `item_ids`. |
+  | `quest` | `config/betterquesting/DefaultQuests/` in the pack. In 2.9.x the quest text is inline in each quest's JSON (`name:8`, `desc:8`), not in a lang file. Chapters come from `QuestLines/`. | One quest: quest line, title, description, tasks with item names, rewards, prerequisites and the quests it unlocks. Metadata: `quest_id` (BetterQuesting's base64 ID, as in the file names), `item_ids`. |
   | `guide` | `config/guidenh/DefaultGuide.zip` (the GTNH Guide Pack 0.1.26 resource pack, CC BY-NC-SA 4.0), plus any `assets/<ns>/guidenh/_en_us/*.md` in mod jars (the tuxmine packs' jars too, e.g. GregGuns' guide) or `resourcepacks/`. | One page. Front matter gives `item_ids` and `quest_ids`; item tags become item names; 3D scenes and recipe widgets are dropped. Split at headings. |
   | `lang` | `assets/<ns>/lang/en_US.lang` in every jar (the GTNH pack's and the tuxmine packs') and in the vanilla server jar, GregTech's multiblock tooltip Markdown (`assets/gregtech/lang/en_US/tooltip/*.md`), and a runtime `GregTech.lang` when one is in the pack directory or `data/corpus/lang/extra/`. | One mod's entries, split by size; one tooltip file. |
   | `wiki` | `data/corpus/wiki/`, written by `mirror_wiki.py --from-dump` and `update_wiki.py`. | One page, split at section headings, keeping the heading path. |

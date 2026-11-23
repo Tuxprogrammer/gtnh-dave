@@ -4,7 +4,7 @@
 #   tools/recipe-export/run.sh <pack-dir>
 #
 # <pack-dir> is a stock GTNH server directory (the extracted GT_New_Horizons_<ver>_Server zip, e.g.
-# .work/gtnh-2.9.0/pack). It is only read: the run copies it to $RECIPE_EXPORT_WORK/server, adds our server
+# .work/gtnh-2.9.1/pack). It is only read: the run copies it to $RECIPE_EXPORT_WORK/server, adds our server
 # pack's mods and configs from $TUXMINE_DIR/server and the oracle jar, starts it with -Dgtnh.oracle.autorun=true,
 # and collects the JSON the oracle writes 20 server ticks after start (some mods, GTNHRates among them, rewrite
 # recipes on the first tick) before it exits the JVM. Nothing connects to the production server; the copy listens
@@ -30,7 +30,7 @@
 #   RECIPES_PYTHON       Python with numpy for the item-cost pass (tools/recipes/item_costs.py)  default python3
 #   JAVA                 java binary (17+)          default /usr/lib/jvm/java-25-openjdk/bin/java, else `java`
 #   JAVA_HOME_BUILD      JDK for the Gradle build (default: the JDK of $JAVA if it has javac, else java-25)
-#   RECIPE_EXPORT_MEM    max heap                   default 6G (GTNH 2.9.0 needs about 5-6 GB)
+#   RECIPE_EXPORT_MEM    max heap                   default 6G (GTNH 2.9.x needs about 5-6 GB)
 #   RECIPE_EXPORT_LOCK   optional flock file to serialize runs (the build and the server wait on it)  default none:
 #                        runs go in parallel, each on its own port and RECIPE_EXPORT_WORK
 #   RECIPE_EXPORT_TIMEOUT seconds                   default 3600

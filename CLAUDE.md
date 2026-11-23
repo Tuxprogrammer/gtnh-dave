@@ -4,7 +4,7 @@ Orientation for agents working in this repo. Read `README.md` for the architectu
 
 ## What this is
 
-Dave is an AI chat agent for a **GT New Horizons 2.9.0 server** (Minecraft 1.7.10, Forge). It has three parts:
+Dave is an AI chat agent for a **GT New Horizons 2.9.x server** (Minecraft 1.7.10, Forge). It has three parts:
 
 - `DaveBridge/`: one Forge mod jar with a server side and a client side. It bridges chat and runs code.
 - The daemon (`dave/daemon/`, Python, standard library only) runs the chat loop between DaveBridge's WebSocket and the Claude process. Claude reaches the mod through the `bridge` MCP server (`dave/bridge/`: `eval`, `describe`, `say`, `lesson`, saved queries), which forwards each call through the daemon. `dave/TOOLS.md` lists every tool.
@@ -64,7 +64,7 @@ Dave is an AI chat agent for a **GT New Horizons 2.9.0 server** (Minecraft 1.7.1
   - `mods/` is source for every jar (exact `-sources.jar` where the pack's jar has one, otherwise a decompile remapped to MCP names), indexed in `INDEX.md` (its `origin` column says which). It is the grep fallback.
   - `source/` holds real upstream source at the exact refs the pack ships, indexed in `SOURCE-INDEX.md` and `source-index.json` (with license and match quality).
 
-  Prefer `source/` whenever a mod has it. Known exceptions in GTNH 2.9.0: GalaxySpace's checkout is the author's diverged line (use the decompile), Witchery's "source" is a decompiled dump, and Thaumcraft 4, IC2, Extra Utilities and BiblioCraft are decompile-only.
+  Prefer `source/` whenever a mod has it. Known exceptions in GTNH 2.9.x: GalaxySpace's checkout is the author's diverged line (use the decompile), Witchery's "source" is a decompiled dump, and Thaumcraft 4, IC2, Extra Utilities and BiblioCraft are decompile-only.
 - Jars from extra packs get their exact source too (`tools/decomp/tuxmine_extras.py`, mapped in `tools/decomp/tuxmine-extras.json`); it fails on any unmapped jar, so map new ones first.
 - **Check the license before copying any code into a mod.** It's in `source-index.json`; some repos have no license or are All Rights Reserved.
 - **Exclude `gtnh-src/_decompiled/` from grep and search.** It holds superseded decompiles and duplicates every hit.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gregtech: Vineflower 1.12.0 needs >14 GB on gregtech/api/enums/ItemList (huge enum <clinit>),
 # so that class is decompiled with CFR and everything else with Vineflower (full jar as library context).
-# usage: gregtech_split.sh WORK_DIR(.work/gtnh-2.9.0) OUT_DIR(gtnh-src/mods/gregtech)
+# usage: gregtech_split.sh WORK_DIR(.work/gtnh-2.9.1) OUT_DIR(gtnh-src/mods/gregtech)
 set -euo pipefail
 # Absolute paths first: everything below runs after `cd "$S"`, so relative arguments would resolve there.
 W=$(realpath -e "$1"); OUT=$(realpath -m "$2"); S=$W/gt-split; mkdir -p "$S"; cd "$S"

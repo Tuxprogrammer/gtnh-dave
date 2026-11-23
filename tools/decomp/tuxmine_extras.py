@@ -817,7 +817,7 @@ def packs_txt(packs):
 
 def source_index_block(items, rows):
     L = [BEGIN, "## Tuxmine extras", "",
-         "Our server's own additions on top of stock GTNH 2.9.0: every jar in the tuxmine packwiz packs "
+         "Our server's own additions on top of stock GTNH " + (packstate.gtnh_version(packstate.gtnh_pack_dir()) or "") + ": every jar in the tuxmine packwiz packs "
          "(`server` = the game server, `client` = players' instances), including our own mods (GregGuns, Lost Cities: "
          "New Horizons, Fortunate One) and **DaveBridge itself**. Checked out like the GTNH mods above (shallow, "
          "partial, sparse, no binary assets; `.git/CLONE_OK`), except DaveBridge, which is a `git archive` of this "

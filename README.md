@@ -2,7 +2,7 @@
 
 Dave is an AI agent that lives in the chat of a GT New Horizons server. Players ask him questions in game ("dave, what's the EU/t of the EBF steel recipe?") and he answers in chat. To do that he reads the pack's source code, looks up recipes exported from the pack itself, and runs small Groovy scripts against the live server.
 
-He was built for a small private GTNH 2.9.0 server with trusted players. This repo is the reusable part: the mod, the agent and the tools that build his pack knowledge. It has no server setup, deploy files or pack data; you bring your own server and build the data from your own pack.
+He was built for a small private GTNH 2.9.x server with trusted players. This repo is the reusable part: the mod, the agent and the tools that build his pack knowledge. It has no server setup, deploy files or pack data; you bring your own server and build the data from your own pack.
 
 Dave runs on the **Claude Code CLI** with a Claude subscription, not with API tokens.
 
@@ -10,7 +10,7 @@ Dave runs on the **Claude Code CLI** with a Claude subscription, not with API to
 
 ```
 ┌───────────────────────┐  FML packets  ┌──────────────────────────────┐  WebSocket (token)  ┌──────────────────────┐
-│ Player client         │ ◀───────────▶ │ GTNH 2.9.0 server            │ ◀─────────────────▶ │ Dave daemon          │
+│ Player client         │ ◀───────────▶ │ GTNH 2.9.1 server            │ ◀─────────────────▶ │ Dave daemon          │
 │  └─ DaveBridge (opt.) │  ask/context  │  └─ DaveBridge (server side) │  chat / say / eval  │ (MCP server + bridge)│
 │      • context capture│  messages     │      • chat hooks + relay    │                     └──────────┬───────────┘
 │      • client eval    │  client eval  │      • main-thread queue     │                                │ stream-json
@@ -39,7 +39,7 @@ Dave runs on the **Claude Code CLI** with a Claude subscription, not with API to
 
 ## Getting started
 
-You need a GTNH 2.9.0 server you control (Java 17+ via lwjgl3ify), Python 3.11+, and Claude Code logged in with a subscription.
+You need a GTNH 2.9.x server you control (Java 17+ via lwjgl3ify), Python 3.11+, and Claude Code logged in with a subscription.
 
 1. **Build and install DaveBridge.** `cd DaveBridge && ./gradlew build`, then put the jar on the server (and, optionally, on players' clients). In the server's `config/davebridge.cfg`, set `authToken` (the same value goes in Dave's `DAVE_BRIDGE_TOKEN`), and `bindAddress`/`port` (default 25580) if the daemon runs elsewhere; `/dave status` and `/dave reload` help. Never publish the WebSocket port: keep the daemon on the same host or private network.
 2. **Build Dave's pack knowledge from your pack.** Extract the GTNH server pack to `.work/gtnh-<version>/pack/` (or set `GTNH_PACK_DIR`), then run `tools/refresh-pack-data.sh`. It builds `gtnh-src/`, exports the recipe database with a headless throwaway server, extracts the search corpus and embeds it, rebuilding only what is stale. Embeddings use OpenRouter (`OPENROUTER_API_KEY` in a git-ignored `.env`); that is the only API key involved. Each tool's README or header has the details.

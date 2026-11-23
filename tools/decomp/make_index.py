@@ -114,7 +114,7 @@ def main(cfg_path):
              'version shipped (pack jar SHA-1 == maven jar SHA-1), extracted as-is with MCP names; '
              '`decompiled` = Vineflower output with SRG->MCP remap. `files` = source files written '
              '(.java/.kt/.scala; for decompiled jars, top-level classes). `pack name` comes from the GTNH '
-             'DreamAssemblerXXL 2.9.0 release manifest; the last column is an UNVERIFIED HINT taken from that '
+             f"DreamAssemblerXXL {man.get('version', '')} release manifest; the last column is an UNVERIFIED HINT taken from that "
              'manifest / mcmod.info, not a checked source location.', '',
              '| jar | modid(s) | name | version (mcmod.info) | origin | output dir | files | pack name | upstream repo (unverified hint) |',
              '|---|---|---|---|---|---|---|---|---|']
