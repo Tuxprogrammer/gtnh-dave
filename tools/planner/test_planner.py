@@ -528,6 +528,18 @@ class ImportCurrent(Base):
         self.assertEqual(self.daemon.calls[-1]["op"], "surface_attachment")
         self.assertEqual(self.daemon.calls[-1]["args"], {})
 
+    def test_attachment_passed_through_verbatim(self):
+        # A card built in game carries its recipe content; nulls and all, the site gets what the panel sent.
+        self.snapshot["cards"] = [{"id": "gtnhplanner:9f1c", "recipeId": "gtnhplanner:9f1c", "board": None,
+                                   "recipe": {"name": None, "machineType": "Mixer", "durationTicks": 300, "eut": 30,
+                                              "inputs": [{"kind": "item", "id": "a", "amount": 1, "consumed": False}],
+                                              "outputs": [{"kind": "item", "id": "b", "amount": 2}]},
+                                   "sectionRecipes": []}]
+        self.att.write_text(json.dumps(self.snapshot))
+        text, err = self.call("plan_import_current")
+        self.assertFalse(err, text)
+        self.assertEqual(self.site.requests[-1]["body"], {"snapshot": self.snapshot})
+
     def test_turn_and_earlier(self):
         self.daemon.reply["result"]["earlier"] = True
         out = json.loads(self.call("plan_import_current", turn="t-0123456789")[0])

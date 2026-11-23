@@ -186,10 +186,12 @@ ENDPOINTS = {
     "plan_expand_inputs": ("plans/expand-inputs", (
         "What could make each input a draft still needs (it must have a target): up to max candidates per input, "
         "each actually tried in a copy of the draft and solved, with machines, euPerItem, newRaws, "
-        "usesByproducts, works, steamPerSecond (steam counted at 2 L per EU in euPerItem) and a plain reason. Inputs "
+        "usesByproducts, spares (byproducts it would leave unused), works, steamPerSecond (steam counted at 2 L per EU "
+        "in euPerItem) and a plain reason. Inputs "
         "marked raw: true may stay unsupplied; accepted lists "
         "the free ones. Up to 6 inputs per call: more: true and remaining mean page on with resources. The rank "
-        "ignores leftover byproducts (named in reason), calls some never-spawning ore materials raw "
+        "weighs leftovers by amount, not worth (a spare of anything ranks after none), calls some never-spawning ore "
+        "materials raw "
         "and sees only the first 12 recipes per input: judge it, don't just take the top one. "
         "Add your choice with plan_add_cards and its recipeId. constraints apply to this call only."),
         schema(dict(PLAN, resources={"type": "array", "items": RESOURCE, "maxItems": 16}, constraints=CONSTRAINTS,
@@ -215,7 +217,9 @@ IMPORT_CURRENT = {
     "name": "plan_import_current",
     "description": (
         "Import the plan the player attached to this turn's GTNH Planner panel ask as a draft; returns {planId, "
-        "cardCount, wireCount, warnings} and which ask the attachment came from. Then change the draft and use plan_diff for a proposal. An ask "
+        "cardCount, wireCount, warnings} and which ask the attachment came from. Cards built in game are matched to "
+        "the dataset's recipe by content; a warning naming a card as kept as it is means an opaque card that the "
+        "draft must not change. Then change the draft and use plan_diff for a proposal. An ask "
         "without an attachment is refused rather than falling back to an older copy; turn picks another turn's attachment on purpose."),
     "inputSchema": schema({"turn": {"type": "string", "description": "A turn id (t-0123456789); default: this "
                                                                      "turn, else the asker's newest."}}),
@@ -484,10 +488,11 @@ class Service:
                 snapshot = json.load(f)
         except (OSError, ValueError, KeyError, TypeError):
             raise PlannerError("the attached plan could not be read (it may be gone: only the newest 50 are kept)")
+        # The attachment goes to the site exactly as the panel sent it: clean() would drop explicit nulls inside it.
         body = {"snapshot": snapshot}
         if args.get("player"):
             body["player"] = args["player"]
-        result = self.post("plans/import", clean(body))
+        result = self.post("plans/import", body)
         source = {k: meta.get(k) for k in ("turn", "surface", "bytes", "earlier") if meta.get(k) is not None}
         return dict(result, attachment=source) if isinstance(result, dict) else result
 
