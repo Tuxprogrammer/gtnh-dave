@@ -957,6 +957,17 @@ class Names:
                 return v
         return None
 
+    def nbt_item(self, reg, tag):
+        """Name of a stack whose NBT says what it is, or None. CropsNH has one seed item for every crop, with the crop
+        in tag crop:8 ("cropsnh:blueOrchid"); the game calls it "<crop> Seeds". Crops whose card renames them in code
+        (vanilla ones, Gaia Wart) have no cropsnh_crops lang key, so their id in words stands in."""
+        if reg != "cropsnh:genericSeed" or not isinstance(tag, dict) or not tag.get("crop:8"):
+            return None
+        crop = str(tag["crop:8"]).split(":")[-1]
+        words = camel_words(crop)
+        name = self._get("cropsnh_crops." + crop) or (words[:1].upper() + words[1:])
+        return name + " Seeds" + ("" if tag.get("scan:1") else " (unscanned)")
+
     def item_label(self, spec):
         reg, damage = parse_spec(spec)
         return self.item(reg, damage) or spec
@@ -1017,7 +1028,7 @@ def bq_text(s):
 def stack_text(names, st):
     reg, dmg, count = st.get("id:8", "?"), int(st.get("Damage:2", 0)), int(st.get("Count:3", 1))
     ore = st.get("OreDict:8") or ""
-    label = names.item(reg, dmg) or item_spec(reg, dmg)
+    label = names.nbt_item(reg, st.get("tag:10")) or names.item(reg, dmg) or item_spec(reg, dmg)
     if ore:
         label += " (any %s)" % ore
     return ("%d × %s" % (count, label)) if count > 1 else label, item_spec(reg, dmg)

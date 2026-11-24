@@ -219,6 +219,20 @@ class SourceTest(unittest.TestCase):
             self.assertIn("Unlocks: EBF-Time", docs[qid(-5, 9)]["text"])
             self.assertTrue((f.ctx.corpus / "quest" / "docs.jsonl").is_file())
 
+    def test_crop_seed_named_from_its_nbt(self):
+        n = s.Names.__new__(s.Names)
+        n.lang = {"cropsnh_crops.purpleTulip": "Purple Tulip"}
+        n.lower = {k.lower(): v for k, v in n.lang.items()}
+        n.overlay = {("cropsnh:genericSeed", "0"): "Vine Seeds"}       # whichever crop the export happened to name
+        seed = {"id:8": "cropsnh:genericSeed", "Count:3": 2}
+        self.assertEqual(s.stack_text(n, dict(seed, **{"tag:10": {"crop:8": "cropsnh:purpleTulip", "scan:1": 1}}))[0],
+                         "2 × Purple Tulip Seeds")
+        self.assertEqual(s.stack_text(n, dict(seed, **{"tag:10": {"crop:8": "cropsnh:blueOrchid", "scan:1": 1}}))[0],
+                         "2 × Blue Orchid Seeds")                        # no lang key: the id in words
+        self.assertEqual(s.stack_text(n, dict(seed, **{"tag:10": {"crop:8": "cropsnh:purpleTulip"}}))[0],
+                         "2 × Purple Tulip Seeds (unscanned)")
+        self.assertEqual(s.stack_text(n, {"id:8": "cropsnh:genericSeed"})[0], "Vine Seeds")   # no tag: the item's name
+
     def test_quest_id_matches_file_suffix(self):
         self.assertEqual(s.bq_id({"questIDHigh:4": 0, "questIDLow:4": 852}), "AAAAAAAAAAAAAAAAAAADVA==")
         self.assertNotIn("+", qid(-5, 9) + qid(1 << 62, -1))

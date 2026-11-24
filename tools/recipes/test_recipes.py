@@ -75,6 +75,15 @@ class NormalizerTests(SampleDB):
         self.assertGreater(m["counts"]["recipes"], 250)
         self.assertEqual(set(m), set(self.meta))
 
+    def test_nbt_named_item_gets_a_fixed_name(self):
+        """Every CropsNH seed shares one node id; the first crop's name must not become the item's name."""
+        cat = build_db.Catalog()
+        for crop in ("Purple Tulip Seeds", "Vine Seeds"):
+            cat.add({"kind": "item", "id": "cropsnh:genericseed", "displayName": crop}, "cropsnh:genericseed")
+        cat.add({"kind": "item", "id": "minecraft:vine", "displayName": "Vines"}, "minecraft:vine")
+        self.assertEqual(cat.items["cropsnh:genericseed"]["name"], "Crops NH Seeds (any crop)")
+        self.assertEqual(cat.items["minecraft:vine"]["name"], "Vines")
+
     def test_content_hash_ignores_export_order(self):
         """Recipe ids are content hashes: a shuffled export gives the same ids (the oracle's own ids would not)."""
         data = load_sample()

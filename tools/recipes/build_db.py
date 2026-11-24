@@ -86,6 +86,9 @@ RAW_SEED = {
 # Display names that are not the item's name. GT's OreDictRegistrationHandler renames the stacks it registers under
 # a malformed ore dictionary tag to this (the NOR wafer is registered as "wafer"), and the oracle reads those stacks.
 BAD_NAMES = {"Invalid OreDictionary Tag"}
+# Items whose display name comes from NBT, which node ids drop: every CropsNH seed is cropsnh:genericseed, named after
+# whichever crop's recipe the export lists first. They get a fixed name instead.
+NBT_NAMED = {"cropsnh:genericseed": "Crops NH Seeds (any crop)"}
 
 
 def log(msg):
@@ -164,6 +167,8 @@ class Catalog:
                 if not e["name"]:
                     e["name"] = "Any of: " + ", ".join(
                         (a.get("displayName") or node_id(a) or "?") for a in (res.get("alternatives") or [])[:4])
+        elif nid in NBT_NAMED:
+            e["name"] = NBT_NAMED[nid]
         elif name and name not in BAD_NAMES and (not e["name"] or e["name"] == nid):
             e["name"] = str(name)
         if res.get("modId") and not e["mod"]:
