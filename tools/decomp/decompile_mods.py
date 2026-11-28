@@ -81,33 +81,46 @@ def main():
         mem = 6000 if n > 4000 else 3500 if n > 1500 else 2000 if n > 400 else 1200
         thr = 8 if n > 4000 else 4 if n > 400 else 2
         mem, thr = a.mem_mb or mem, a.threads or thr
-        with cond:
-            while used[0] + mem > a.mem_budget_mb and used[0] > 0:
-                cond.wait()
-            used[0] += mem
         dest = os.path.join(a.out, name)
-        shutil.rmtree(dest, ignore_errors=True)
-        t0 = time.time()
         log = os.path.join(a.work, 'logs', name + '.log')
-        try:
-            with open(log, 'w') as lf:
-                p = subprocess.run(['java', f'-Xmx{mem}m', '-jar', a.vf, '--folder', '--log-level=warn',
-                                    f'--thread-count={thr}', '--indent-string=    ',
-                                    '--dump-bytecode-on-error=false', prep, dest],
-                                   stdout=lf, stderr=subprocess.STDOUT, timeout=3600)
-            r['rc'] = p.returncode
-        except subprocess.TimeoutExpired:
-            r['rc'] = 'timeout'
-        finally:
+        t0 = time.time()
+        # Vineflower survives an OutOfMemoryError inside one method: it logs it, writes that method as
+        # "$VF: Couldn't be decompiled" and exits 0. So a jar whose log shows one is decompiled once more
+        # with a larger heap (bounded by the budget), and its result records the heap that was used.
+        for attempt in (0, 1):
             with cond:
-                used[0] -= mem; cond.notify_all()
+                while used[0] + mem > a.mem_budget_mb and used[0] > 0:
+                    cond.wait()
+                used[0] += mem
+            shutil.rmtree(dest, ignore_errors=True)
+            try:
+                with open(log, 'w') as lf:
+                    p = subprocess.run(['java', f'-Xmx{mem}m', '-jar', a.vf, '--folder', '--log-level=warn',
+                                        f'--thread-count={thr}', '--indent-string=    ',
+                                        '--dump-bytecode-on-error=false', prep, dest],
+                                       stdout=lf, stderr=subprocess.STDOUT, timeout=3600)
+                r['rc'] = p.returncode
+            except subprocess.TimeoutExpired:
+                r['rc'] = 'timeout'
+            finally:
+                with cond:
+                    used[0] -= mem; cond.notify_all()
+            r['mem_mb'] = mem
+            with open(log, errors='replace') as lf:
+                oom = 'OutOfMemoryError' in lf.read()
+            bigger = min(max(mem * 4, 8000), a.mem_budget_mb)
+            if not oom or attempt or bigger <= mem:
+                r['out_of_memory'] = oom
+                break
+            print(f"[retry] {jb}: out of memory with {mem} MB, again with {bigger} MB", flush=True)
+            mem = bigger
         r['secs'] = round(time.time() - t0, 1)
         java = sum(1 for dp, _, fs in os.walk(dest) for f in fs if f.endswith(('.java', '.kt')))
         r['java_files'] = java
         with open(log, errors='replace') as lf:
             txt = lf.read()
         r['errors'] = txt.count('ERROR') + txt.count('Exception')
-        r['status'] = 'ok' if r['rc'] == 0 and (java > 0 or n == 0) else 'failed'
+        r['status'] = 'ok' if r['rc'] == 0 and (java > 0 or n == 0) and not r['out_of_memory'] else 'failed'
         print(f"[{r['status']}] {jb} -> {name}: {java}/{n} java, {r['secs']}s, rc={r['rc']}", flush=True)
         return r
 

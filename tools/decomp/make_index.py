@@ -90,7 +90,9 @@ def main(cfg_path):
         modid = ', '.join(modids) if modids else (', '.join(ann) + ' (@Mod)' if ann else '-')
         name = '; '.join(dict.fromkeys(m.get('name', '') for m in infos if m.get('name'))) or meta.get('pack_name', '-')
         ver = '; '.join(dict.fromkeys(str(m.get('version', '')) for m in infos if m.get('version'))) or '-'
-        src = meta.get('tag_url') or meta.get('url') or ''
+        # A results entry may carry 'upstream_hint' to replace the manifest link (e.g. a private repo that the
+        # manifest still points at).
+        src = r.get('upstream_hint') or meta.get('tag_url') or meta.get('url') or ''
         if not src:
             urls = [m.get('url', '') for m in infos if 'github.com' in str(m.get('url', ''))]
             src = (urls[0] + ' (mcmod.info)') if urls else ''

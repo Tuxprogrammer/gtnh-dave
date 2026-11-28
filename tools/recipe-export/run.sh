@@ -4,7 +4,7 @@
 #   tools/recipe-export/run.sh <pack-dir>
 #
 # <pack-dir> is a stock GTNH server directory (the extracted GT_New_Horizons_<ver>_Server zip, e.g.
-# .work/gtnh-2.9.1/pack). It is only read: the run copies it to $RECIPE_EXPORT_WORK/server, adds our server
+# .work/gtnh-2.9.2/pack). It is only read: the run copies it to $RECIPE_EXPORT_WORK/server, adds our server
 # pack's mods and configs from $TUXMINE_DIR/server and the oracle jar, starts it with -Dgtnh.oracle.autorun=true,
 # and collects the JSON the oracle writes 20 server ticks after start (some mods, GTNHRates among them, rewrite
 # recipes on the first tick) before it exits the JVM. Nothing connects to the production server; the copy listens

@@ -10,7 +10,7 @@ Dave runs on the **Claude Code CLI** with a Claude subscription, not with API to
 
 ```
 ┌───────────────────────┐  FML packets  ┌──────────────────────────────┐  WebSocket (token)  ┌──────────────────────┐
-│ Player client         │ ◀───────────▶ │ GTNH 2.9.1 server            │ ◀─────────────────▶ │ Dave daemon          │
+│ Player client         │ ◀───────────▶ │ GTNH 2.9.2 server            │ ◀─────────────────▶ │ Dave daemon          │
 │  └─ DaveBridge (opt.) │  ask/context  │  └─ DaveBridge (server side) │  chat / say / eval  │ (MCP server + bridge)│
 │      • context capture│  messages     │      • chat hooks + relay    │                     └──────────┬───────────┘
 │      • client eval    │  client eval  │      • main-thread queue     │                                │ stream-json
